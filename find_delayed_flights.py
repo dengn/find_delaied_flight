@@ -21,9 +21,12 @@
 
 import argparse
 import json
+import smtplib
 import sys
 import time
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import requests
 
@@ -648,6 +651,255 @@ def run_detection(api_key: str, date: str, hubs: dict,
 
 
 # ============================================================
+# 邮件通知
+# ============================================================
+
+def build_email_html(hits: list) -> str:
+    """构建 HTML 邮件正文"""
+    rows = []
+    for i, hit in enumerate(hits, 1):
+        delay = hit["estimated_delay_min"]
+        mins_left = hit["minutes_until_departure"]
+        hours_left = mins_left // 60
+        mins_remain = mins_left % 60
+
+        row = f"""
+        <tr style="border-bottom: 2px solid #e74c3c;">
+          <td colspan="2" style="padding:12px; background:#fff3f3;">
+            <h3 style="margin:0; color:#c0392b;">
+              [{i}] {hit['flight']}  {hit['route']}  ({hit['dep_city']})
+            </h3>
+          </td>
+        </tr>
+        <tr><td style="padding:6px 12px; color:#666;">计划出发</td>
+            <td style="padding:6px 12px;">{hit['plan_departure']}
+            (距现在 {hours_left}时{mins_remain}分)</td></tr>
+        <tr><td style="padding:6px 12px; color:#666;">当前状态</td>
+            <td style="padding:6px 12px; font-weight:bold; color:#e74c3c;">
+            {hit['current_state']} ← 航司未通知航变!</td></tr>
+        <tr><td style="padding:6px 12px; color:#666;">机型 / 机号</td>
+            <td style="padding:6px 12px;">{hit['aircraft_type']}
+            ({hit.get('aircraft_model','')}) / {hit['aircraft']}</td></tr>
+        <tr style="background:#fff8e1;">
+          <td style="padding:6px 12px; color:#e65100; font-weight:bold;">
+            预估延误</td>
+          <td style="padding:6px 12px; color:#e65100; font-weight:bold;
+              font-size:18px;">
+            ~{delay} 分钟</td></tr>
+        <tr><td style="padding:6px 12px; color:#666;">最早可出发</td>
+            <td style="padding:6px 12px;">{hit['earliest_possible_dep']}</td></tr>
+        <tr><td style="padding:6px 12px; color:#666;">确定性</td>
+            <td style="padding:6px 12px;">{hit['certainty']}</td></tr>
+        <tr style="background:#f5f5f5;">
+          <td style="padding:6px 12px; color:#666;">前序航班</td>
+          <td style="padding:6px 12px;">{hit['inbound_flight']}
+            {hit['inbound_route']}  状态: {hit['inbound_state']}</td></tr>
+        <tr style="background:#f5f5f5;">
+          <td style="padding:6px 12px; color:#666;">前序延误</td>
+          <td style="padding:6px 12px;">{hit['inbound_delay_min']}分钟
+            (计划到{hit['inbound_plan_arrival']}
+            → 预计{hit['inbound_est_arrival']})</td></tr>
+        <tr><td colspan="2" style="padding:4px;"></td></tr>
+        """
+        rows.append(row)
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html = f"""
+    <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;">
+    <div style="max-width:700px; margin:0 auto;">
+      <div style="background:#c0392b; color:white; padding:16px; text-align:center;">
+        <h2 style="margin:0;">南航航变机会提醒</h2>
+        <p style="margin:4px 0 0; font-size:13px;">检测时间: {now_str}</p>
+      </div>
+      <div style="padding:12px; background:#fff3f3; text-align:center;">
+        <span style="font-size:20px; font-weight:bold; color:#c0392b;">
+          发现 {len(hits)} 个可操作机会!
+        </span>
+      </div>
+      <table style="width:100%; border-collapse:collapse; font-size:14px;">
+        {''.join(rows)}
+      </table>
+      <div style="padding:12px; background:#f9f9f9; color:#999; font-size:12px;
+                  text-align:center;">
+        南航航变机会检测器 — 持续监控中
+      </div>
+    </div>
+    </body></html>
+    """
+    return html
+
+
+def send_email(to_addr: str, smtp_pass: str, hits: list,
+               smtp_host: str = "smtp.qq.com", smtp_port: int = 465,
+               from_addr: str = None) -> bool:
+    """通过 QQ 邮箱发送航变提醒邮件"""
+    if from_addr is None:
+        from_addr = to_addr  # 默认自己给自己发
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = (f"[航变提醒] 发现 {len(hits)} 个机会! "
+                      f"{hits[0]['flight']} 预延{hits[0]['estimated_delay_min']}分钟")
+    msg["From"] = f"航变检测器 <{from_addr}>"
+    msg["To"] = to_addr
+
+    # 纯文本备用
+    text_lines = []
+    for i, hit in enumerate(hits, 1):
+        text_lines.append(
+            f"[{i}] {hit['flight']} {hit['route']} "
+            f"预估延误{hit['estimated_delay_min']}分钟 "
+            f"当前状态:{hit['current_state']} "
+            f"计划出发:{hit['plan_departure']}")
+    msg.attach(MIMEText("\n".join(text_lines), "plain", "utf-8"))
+
+    # HTML 正文
+    html = build_email_html(hits)
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as server:
+            server.login(from_addr, smtp_pass)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+        print(f"  [邮件] 已发送提醒到 {to_addr}", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"  [邮件失败] {e}", file=sys.stderr)
+        return False
+
+
+# ============================================================
+# 持续监控
+# ============================================================
+
+def make_hit_key(hit: dict) -> str:
+    """生成航班唯一标识，用于去重"""
+    return f"{hit['flight']}|{hit['plan_departure']}|{hit['aircraft']}"
+
+
+def monitor_loop(args, hubs: dict):
+    """持续监控主循环"""
+    import signal
+
+    cycle_min = args.cycle
+    notified = {}  # key -> last_notified_time
+    # 通知去重有效期（小时），超过后同一航班可再次通知
+    DEDUP_HOURS = 6
+
+    stop_flag = [False]
+
+    def handle_signal(signum, frame):
+        stop_flag[0] = True
+        print("\n  [监控] 收到停止信号，完成当前周期后退出...", file=sys.stderr)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    cycle_count = 0
+    total_hits_found = 0
+
+    print(f"\n{'='*70}")
+    print(f"  南航航变机会 — 持续监控模式")
+    print(f"  监控周期: 每 {cycle_min} 分钟")
+    print(f"  通知邮箱: {args.email}")
+    print(f"  活跃时段: {args.active_start}:00 - {args.active_end}:00")
+    print(f"  按 Ctrl+C 安全退出")
+    print(f"{'='*70}\n")
+
+    while not stop_flag[0]:
+        cycle_count += 1
+        now = datetime.now()
+
+        # 检查活跃时段
+        current_hour = now.hour
+        if not (args.active_start <= current_hour < args.active_end):
+            next_active = now.replace(hour=args.active_start, minute=0, second=0)
+            if current_hour >= args.active_end:
+                next_active += timedelta(days=1)
+            wait_sec = (next_active - now).total_seconds()
+            wait_hr = wait_sec / 3600
+            print(f"  [{now.strftime('%H:%M')}] 非活跃时段 "
+                  f"({args.active_start}:00-{args.active_end}:00), "
+                  f"休眠 {wait_hr:.1f} 小时后自动恢复...")
+            # 分段休眠以便响应中断信号
+            while wait_sec > 0 and not stop_flag[0]:
+                time.sleep(min(wait_sec, 60))
+                wait_sec -= 60
+            continue
+
+        print(f"\n  [{now.strftime('%H:%M:%S')}] === 第 {cycle_count} 轮监控 ===")
+
+        # 更新日期
+        date = now.strftime("%Y-%m-%d")
+
+        # 清理过期去重记录
+        expired_keys = [
+            k for k, t in notified.items()
+            if (now - t).total_seconds() > DEDUP_HOURS * 3600
+        ]
+        for k in expired_keys:
+            del notified[k]
+
+        # 执行检测
+        try:
+            hits = run_detection(
+                args.key, date, hubs,
+                verbose=args.verbose, interval=args.interval,
+                auto_renew=args.auto_renew,
+            )
+        except Exception as e:
+            print(f"  [监控异常] {e}", file=sys.stderr)
+            hits = []
+
+        # 过滤已通知的
+        new_hits = []
+        for hit in hits:
+            key = make_hit_key(hit)
+            if key not in notified:
+                new_hits.append(hit)
+
+        if new_hits:
+            total_hits_found += len(new_hits)
+            print(f"\n  [新发现] {len(new_hits)} 个新机会 "
+                  f"(本轮共{len(hits)}个, 已通知过{len(hits)-len(new_hits)}个)")
+
+            # 发送邮件
+            if args.email and args.smtp_pass:
+                ok = send_email(args.email, args.smtp_pass, new_hits,
+                                from_addr=args.smtp_from)
+                if ok:
+                    for hit in new_hits:
+                        notified[make_hit_key(hit)] = now
+            else:
+                print(f"  [注意] 未配置邮箱授权码(--smtp-pass)，跳过邮件发送",
+                      file=sys.stderr)
+                for hit in new_hits:
+                    notified[make_hit_key(hit)] = now
+        else:
+            if hits:
+                print(f"  [本轮] {len(hits)} 个机会均已通知过，不重复发送")
+            else:
+                print(f"  [本轮] 未发现新机会")
+
+        # 统计
+        print(f"  [统计] 已运行 {cycle_count} 轮, "
+              f"累计发现 {total_hits_found} 个新机会, "
+              f"去重池 {len(notified)} 条")
+
+        if stop_flag[0]:
+            break
+
+        # 等待下一周期
+        print(f"  [休眠] {cycle_min} 分钟后进行下一轮检测...")
+        wait_sec = cycle_min * 60
+        while wait_sec > 0 and not stop_flag[0]:
+            time.sleep(min(wait_sec, 10))
+            wait_sec -= 10
+
+    print(f"\n  [监控结束] 共运行 {cycle_count} 轮, "
+          f"发现 {total_hits_found} 个新机会")
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -664,12 +916,16 @@ def main():
   但航司尚未发布航变通知 → 此时可以买里程票 → 等航变后免费改签/退票
 
 示例:
-  %(prog)s --auto-renew                      # 自动续杯，扫描全部枢纽
+  %(prog)s --auto-renew                      # 单次扫描，自动续杯
   %(prog)s --hub CAN                         # 只扫描广州枢纽
   %(prog)s --hub CAN --dest PKX,PVG,CTU      # 精简扫描指定航线
   %(prog)s --threshold 20                    # 降低前序延误阈值到20分钟
-  %(prog)s --booking-window 60               # 降低买票窗口到1小时
   %(prog)s --json                            # JSON输出（便于程序处理）
+
+  # 持续监控模式 (每15分钟扫描，有结果邮件通知):
+  %(prog)s --monitor --email 634897859@qq.com --smtp-pass YOUR_AUTH_CODE --auto-renew
+  %(prog)s --monitor --cycle 10 --email x@qq.com --smtp-pass CODE  # 10分钟一轮
+  %(prog)s --monitor --active-start 8 --active-end 22              # 自定义活跃时段
         """,
     )
     parser.add_argument(
@@ -731,6 +987,47 @@ def main():
         help="余额不足时自动获取新 Key",
     )
 
+    # ---- 持续监控相关 ----
+    monitor_group = parser.add_argument_group("持续监控模式")
+    monitor_group.add_argument(
+        "--monitor", "-m",
+        action="store_true",
+        help="启用持续监控模式，周期性扫描并邮件通知",
+    )
+    monitor_group.add_argument(
+        "--cycle",
+        type=int,
+        default=15,
+        help="监控周期(分钟)，默认 15",
+    )
+    monitor_group.add_argument(
+        "--email",
+        default=None,
+        help="通知邮箱地址 (例: 634897859@qq.com)",
+    )
+    monitor_group.add_argument(
+        "--smtp-pass",
+        default=None,
+        help="邮箱 SMTP 授权码 (QQ邮箱需在设置中开启SMTP并生成授权码)",
+    )
+    monitor_group.add_argument(
+        "--smtp-from",
+        default=None,
+        help="发件人邮箱 (默认与收件人相同，自己给自己发)",
+    )
+    monitor_group.add_argument(
+        "--active-start",
+        type=int,
+        default=7,
+        help="活跃监控开始时间(整点, 0-23)，默认 7 (早7点)",
+    )
+    monitor_group.add_argument(
+        "--active-end",
+        type=int,
+        default=23,
+        help="活跃监控结束时间(整点, 0-23)，默认 23 (晚11点)",
+    )
+
     args = parser.parse_args()
 
     SIGNIFICANT_DELAY_MINUTES = args.threshold
@@ -751,6 +1048,18 @@ def main():
     else:
         hubs = CZ_HUBS
 
+    # ---- 持续监控模式 ----
+    if args.monitor:
+        if args.email and not args.smtp_pass:
+            print("[错误] 使用邮件通知需要提供 --smtp-pass (QQ邮箱SMTP授权码)",
+                  file=sys.stderr)
+            print("  获取方法: QQ邮箱 → 设置 → 账户 → POP3/SMTP服务 → 开启 → 生成授权码",
+                  file=sys.stderr)
+            sys.exit(1)
+        monitor_loop(args, hubs)
+        sys.exit(0)
+
+    # ---- 单次运行模式 ----
     hits = run_detection(
         args.key, args.date, hubs,
         verbose=args.verbose, interval=args.interval,
