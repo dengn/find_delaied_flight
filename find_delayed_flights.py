@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 
 import requests
 
+from auto_renew_key import obtain_new_key
+
 # ============================================================
 # 配置
 # ============================================================
@@ -64,7 +66,8 @@ REQUEST_INTERVAL = 0.6
 # ============================================================
 
 class VariFlightAPI:
-    def __init__(self, api_key: str, interval: float = REQUEST_INTERVAL):
+    def __init__(self, api_key: str, interval: float = REQUEST_INTERVAL,
+                 auto_renew: bool = False):
         self.api_key = api_key
         self.session = requests.Session()
         self.session.headers.update({
@@ -72,6 +75,9 @@ class VariFlightAPI:
             "Content-Type": "application/json",
         })
         self._interval = interval
+        self._auto_renew = auto_renew
+        self._renew_count = 0
+        self._max_renew = 3  # 最多续杯3次
         self._last_call = 0.0
         self.call_count = 0
         self.error_count = 0
@@ -79,7 +85,9 @@ class VariFlightAPI:
     def _call(self, endpoint: str, params: dict) -> dict:
         """调用飞常准 API，带限速和重试"""
         body = {"endpoint": endpoint, "params": params}
-        for attempt in range(4):
+        max_attempts = 4
+        attempt = 0
+        while attempt < max_attempts:
             # 限速
             now = time.monotonic()
             wait = self._interval - (now - self._last_call)
@@ -96,6 +104,24 @@ class VariFlightAPI:
                     try:
                         err_data = resp.json()
                         if err_data.get("message") == "Insufficient balance":
+                            if (self._auto_renew
+                                    and self._renew_count < self._max_renew):
+                                self._renew_count += 1
+                                print(f"\n  [续杯 {self._renew_count}/{self._max_renew}]"
+                                      f" API 余额不足，自动获取新 Key...",
+                                      file=sys.stderr)
+                                try:
+                                    new_key = obtain_new_key(verbose=True)
+                                    self.api_key = new_key
+                                    self.session.headers["X-VARIFLIGHT-KEY"] = new_key
+                                    self._balance_warned = False
+                                    print(f"  [续杯] 新 Key 已生效: {new_key[:20]}...\n",
+                                          file=sys.stderr)
+                                    # 重置重试计数，用新key重新开始
+                                    attempt = 0
+                                    continue
+                                except Exception as e:
+                                    print(f"  [续杯失败] {e}", file=sys.stderr)
                             if not getattr(self, '_balance_warned', False):
                                 print("\n  [错误] API 余额不足 (Insufficient balance)，"
                                       "请充值后重试。", file=sys.stderr)
@@ -106,10 +132,11 @@ class VariFlightAPI:
                         pass
                     # 触发限速，指数退避
                     backoff = 3 * (2 ** attempt)
-                    if attempt < 3:
+                    if attempt < max_attempts - 1:
                         print(f"  [限速] 等待 {backoff}s 后重试...",
                               file=sys.stderr)
                         time.sleep(backoff)
+                        attempt += 1
                         continue
                     else:
                         self.error_count += 1
@@ -292,9 +319,10 @@ def analyze_delay_risk(departing: dict, inbound: dict) -> dict | None:
 # ============================================================
 
 def run_detection(api_key: str, date: str, hubs: dict,
-                  verbose: bool = False, interval: float = REQUEST_INTERVAL):
+                  verbose: bool = False, interval: float = REQUEST_INTERVAL,
+                  auto_renew: bool = False):
     """运行延误检测"""
-    api = VariFlightAPI(api_key, interval=interval)
+    api = VariFlightAPI(api_key, interval=interval, auto_renew=auto_renew)
     now = datetime.now()
 
     print(f"\n{'='*70}")
@@ -505,6 +533,11 @@ def main():
         action="store_true",
         help="显示详细调试信息",
     )
+    parser.add_argument(
+        "--auto-renew",
+        action="store_true",
+        help="余额不足时自动注册新账号获取 Key（无限续杯）",
+    )
 
     args = parser.parse_args()
 
@@ -531,6 +564,7 @@ def main():
     risks = run_detection(
         args.key, args.date, hubs,
         verbose=args.verbose, interval=args.interval,
+        auto_renew=args.auto_renew,
     )
 
     if args.json:
