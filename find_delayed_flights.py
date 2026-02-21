@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-南航前序航班延误检测器
-检测前序航班已经明显晚到、但后续航班还未发布航延通知的南航航班。
+南航航班延误智能检测器
+综合多维信号检测「一定会延误但还未发布通知」的南航航班。
+
+检测信号：
+  1. 前序航班延误 — 飞机还没到，后续航班铁定晚点
+  2. 天气恶劣 — 出发/到达机场能见度低、暴雨雷暴大风等
+  3. 机场整体态势 — 该机场当天航班大面积延误（流控/停机坪关闭等）
+  4. 飞常准AI预测 — VeryZhun模型已预测延误但官方未通知
+  5. 历史准点率 — 该航班长期准点率低，叠加其他信号则风险更高
 
 使用飞常准 (VariFlight) API 获取航班数据。
 """
@@ -22,8 +29,7 @@ from auto_renew_key import obtain_new_key
 
 API_URL = "https://mcp.variflight.com/api/v1/mcp/data"
 
-# 南航主要枢纽及高频航线目的地（精简版，优先覆盖高频航线）
-# key = 枢纽机场, value = 常飞目的地列表
+# 南航主要枢纽及高频航线目的地
 CZ_HUBS = {
     "CAN": [  # 广州白云 —— 南航最大枢纽
         "PKX", "PVG", "SHA", "CTU", "TFU", "CKG", "WUH", "CSX",
@@ -47,18 +53,36 @@ CZ_HUBS = {
     ],
 }
 
-# 最小过站时间（分钟）: 飞机到达后需要的最少地面周转时间
+# 最小过站时间（分钟）
 MIN_TURNAROUND_NARROW = 45   # 窄体机
 MIN_TURNAROUND_WIDE = 70     # 宽体机
 
 # 宽体机型前缀
 WIDEBODY_TYPES = {"A33", "A34", "A35", "A38", "B74", "B77", "B78", "B76"}
 
-# 判定"明显晚到"的阈值：前序航班预计比计划晚到多少分钟算"明显"
+# 判定"明显晚到"的阈值（分钟）
 SIGNIFICANT_DELAY_MINUTES = 30
 
-# 请求间隔（秒），用于避免触发 API 限速
+# 请求间隔（秒）
 REQUEST_INTERVAL = 0.6
+
+# ---- 天气风险关键词 ----
+WEATHER_SEVERE = {"雷暴", "暴雨", "暴雪", "大暴雨", "冻雨", "冰雹", "台风",
+                  "大雾", "浓雾", "沙尘暴"}
+WEATHER_MODERATE = {"雷阵雨", "大雨", "大雪", "雨夹雪", "中雨", "中雪",
+                    "雾", "扬沙", "霾"}
+
+# 能见度阈值（米）
+VIS_SEVERE = 800     # 低于此值 → 高风险（可能关闭跑道）
+VIS_MODERATE = 1500  # 低于此值 → 中风险
+
+# 风力阈值（级）
+WIND_SEVERE = 8
+WIND_MODERATE = 6
+
+# 机场延误率阈值
+AIRPORT_DELAY_RATE_HIGH = 0.30   # 30%以上航班延误 → 机场大面积延误
+AIRPORT_DELAY_RATE_MODERATE = 0.15
 
 
 # ============================================================
@@ -77,7 +101,7 @@ class VariFlightAPI:
         self._interval = interval
         self._auto_renew = auto_renew
         self._renew_count = 0
-        self._max_renew = 3  # 最多续杯3次
+        self._max_renew = 3
         self._last_call = 0.0
         self.call_count = 0
         self.error_count = 0
@@ -88,7 +112,6 @@ class VariFlightAPI:
         max_attempts = 4
         attempt = 0
         while attempt < max_attempts:
-            # 限速
             now = time.monotonic()
             wait = self._interval - (now - self._last_call)
             if wait > 0:
@@ -100,7 +123,6 @@ class VariFlightAPI:
                 resp = self.session.post(API_URL, json=body, timeout=30)
 
                 if resp.status_code == 403:
-                    # 检查是否余额不足
                     try:
                         err_data = resp.json()
                         if err_data.get("message") == "Insufficient balance":
@@ -117,7 +139,6 @@ class VariFlightAPI:
                                     self._balance_warned = False
                                     print(f"  [续杯] 新 Key 已生效: {new_key[:20]}...\n",
                                           file=sys.stderr)
-                                    # 重置重试计数，用新key重新开始
                                     attempt = 0
                                     continue
                                 except Exception as e:
@@ -130,7 +151,6 @@ class VariFlightAPI:
                             return []
                     except (json.JSONDecodeError, ValueError):
                         pass
-                    # 触发限速，指数退避
                     backoff = 3 * (2 ** attempt)
                     if attempt < max_attempts - 1:
                         print(f"  [限速] 等待 {backoff}s 后重试...",
@@ -151,57 +171,56 @@ class VariFlightAPI:
             except requests.exceptions.ConnectionError:
                 if attempt < 3:
                     time.sleep(2 ** attempt)
+                    attempt += 1
                     continue
                 self.error_count += 1
                 return []
             except (requests.RequestException, json.JSONDecodeError) as e:
                 if attempt < 3:
                     time.sleep(2 ** attempt)
+                    attempt += 1
                     continue
                 self.error_count += 1
                 print(f"  [API 错误] {endpoint} {params}: {e}", file=sys.stderr)
                 return []
 
     def search_flights(self, dep: str, arr: str, date: str) -> list:
-        """查询两个机场之间的航班"""
         result = self._call("flights", {"dep": dep, "arr": arr, "date": date})
-        if isinstance(result, list):
-            return result
-        return []
+        return result if isinstance(result, list) else []
 
     def search_flight_by_number(self, fnum: str, date: str) -> list:
-        """按航班号查询"""
         result = self._call("flight", {"fnum": fnum, "date": date})
         if isinstance(result, list):
             return result
-        if isinstance(result, dict) and result.get("error_code"):
-            return []
-        if isinstance(result, dict):
+        if isinstance(result, dict) and not result.get("error_code"):
             return [result]
         return []
 
+    def get_airport_weather(self, airport_code: str) -> dict:
+        """获取机场未来3天天气"""
+        result = self._call("futureAirportWeather",
+                            {"code": airport_code, "type": "1"})
+        return result if isinstance(result, dict) else {}
+
 
 # ============================================================
-# 核心分析逻辑
+# 时间解析工具
 # ============================================================
 
 def parse_time(time_str: str) -> datetime | None:
-    """解析时间字符串"""
     if not time_str or not time_str.strip():
         return None
-    try:
-        return datetime.strptime(time_str.strip(), "%Y-%m-%d %H:%M:%S")
-    except ValueError:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(time_str.strip(), "%Y-%m-%d %H:%M")
+            return datetime.strptime(time_str.strip(), fmt)
         except ValueError:
-            return None
+            continue
+    return None
 
 
 def get_best_arrival_time(flight: dict) -> datetime | None:
-    """获取航班的最佳到达时间估计（实际 > 预计 > 飞常准预测 > 计划）"""
-    for key in ["FlightArrtimeDate", "FlightArrtimeReadyDate",
-                "VeryZhunReadyArrtimeDate", "FlightArrtimePlanDate"]:
+    for key in ("FlightArrtimeDate", "FlightArrtimeReadyDate",
+                "VeryZhunReadyArrtimeDate", "FlightArrtimePlanDate"):
         t = parse_time(flight.get(key, ""))
         if t:
             return t
@@ -209,9 +228,8 @@ def get_best_arrival_time(flight: dict) -> datetime | None:
 
 
 def get_best_departure_time(flight: dict) -> datetime | None:
-    """获取航班的最佳出发时间估计"""
-    for key in ["FlightDeptimeDate", "FlightDeptimeReadyDate",
-                "VeryZhunReadyDeptimeDate", "FlightDeptimePlanDate"]:
+    for key in ("FlightDeptimeDate", "FlightDeptimeReadyDate",
+                "VeryZhunReadyDeptimeDate", "FlightDeptimePlanDate"):
         t = parse_time(flight.get(key, ""))
         if t:
             return t
@@ -219,35 +237,218 @@ def get_best_departure_time(flight: dict) -> datetime | None:
 
 
 def is_widebody(ftype: str) -> bool:
-    """判断是否宽体机"""
-    if not ftype:
-        return False
-    return ftype[:3].upper() in WIDEBODY_TYPES
+    return bool(ftype) and ftype[:3].upper() in WIDEBODY_TYPES
 
 
 def get_min_turnaround(ftype: str) -> int:
-    """获取最小过站时间"""
     return MIN_TURNAROUND_WIDE if is_widebody(ftype) else MIN_TURNAROUND_NARROW
 
+
+# ============================================================
+# 信号 1: 天气风险评估
+# ============================================================
+
+def parse_inline_weather(weather_str: str) -> dict | None:
+    """解析航班数据中内嵌的天气字符串 (格式: '多云|9999|3级|26|22')"""
+    if not weather_str:
+        return None
+    parts = weather_str.split("|")
+    if len(parts) < 4:
+        return None
+    result = {"type": parts[0]}
+    # 能见度
+    try:
+        result["visibility"] = int(parts[1])
+    except (ValueError, IndexError):
+        result["visibility"] = 9999
+    # 风力
+    try:
+        result["wind_level"] = int(parts[2].replace("级", ""))
+    except (ValueError, IndexError):
+        result["wind_level"] = 0
+    return result
+
+
+def assess_weather_risk(weather: dict | None) -> tuple[int, list[str]]:
+    """
+    评估天气风险。
+    返回 (风险分, 原因列表)
+    风险分: 0=无风险, 1-3=轻微, 4-6=中等, 7-10=严重
+    """
+    if not weather:
+        return 0, []
+    score = 0
+    reasons = []
+    wtype = weather.get("type", "")
+    vis = weather.get("visibility", 9999)
+    wind = weather.get("wind_level", 0)
+
+    # 天气类型
+    for kw in WEATHER_SEVERE:
+        if kw in wtype:
+            score += 7
+            reasons.append(f"恶劣天气({wtype})")
+            break
+    else:
+        for kw in WEATHER_MODERATE:
+            if kw in wtype:
+                score += 4
+                reasons.append(f"不良天气({wtype})")
+                break
+
+    # 能见度
+    if vis < VIS_SEVERE:
+        score += 6
+        reasons.append(f"极低能见度({vis}m)")
+    elif vis < VIS_MODERATE:
+        score += 3
+        reasons.append(f"低能见度({vis}m)")
+
+    # 风力
+    if wind >= WIND_SEVERE:
+        score += 5
+        reasons.append(f"大风({wind}级)")
+    elif wind >= WIND_MODERATE:
+        score += 2
+        reasons.append(f"较大风({wind}级)")
+
+    return min(score, 10), reasons
+
+
+def assess_airport_weather(weather_data: dict) -> tuple[int, list[str]]:
+    """评估机场天气API返回的详细天气数据"""
+    if not weather_data:
+        return 0, []
+    current = weather_data.get("current", {})
+    if not current:
+        return 0, []
+
+    score = 0
+    reasons = []
+    wtype = current.get("Type", "")
+    vis_str = current.get("Visib", "9999")
+    wind_str = current.get("WindPower", "0级")
+
+    try:
+        vis = int(vis_str)
+    except ValueError:
+        vis = 9999
+    try:
+        wind = int(wind_str.replace("级", ""))
+    except ValueError:
+        wind = 0
+
+    weather_info = {"type": wtype, "visibility": vis, "wind_level": wind}
+    return assess_weather_risk(weather_info)
+
+
+# ============================================================
+# 信号 2: 机场整体态势分析
+# ============================================================
+
+def analyze_airport_situation(all_flights: list) -> dict:
+    """
+    分析机场所有航班的整体态势。
+    返回: {
+        total: 总航班数,
+        delayed: 延误航班数,
+        cancelled: 取消航班数,
+        delay_rate: 延误率,
+        avg_delay_min: 平均延误分钟,
+        situation: "正常" | "轻微拥堵" | "大面积延误"
+    }
+    """
+    total = 0
+    delayed = 0
+    cancelled = 0
+    delay_minutes = []
+
+    for fl in all_flights:
+        state = fl.get("FlightState", "")
+        total += 1
+
+        if state in ("取消", "提前取消"):
+            cancelled += 1
+            continue
+
+        if state == "延误":
+            delayed += 1
+
+        # 计算实际延误（已出发/到达的航班）
+        plan_dep = parse_time(fl.get("FlightDeptimePlanDate", ""))
+        actual_dep = parse_time(fl.get("FlightDeptimeDate", ""))
+        if not actual_dep:
+            actual_dep = parse_time(fl.get("FlightDeptimeReadyDate", ""))
+
+        if plan_dep and actual_dep:
+            diff = (actual_dep - plan_dep).total_seconds() / 60
+            if diff > 15:  # 15分钟以上算延误
+                delayed += 1 if state != "延误" else 0  # 避免重复计数
+                delay_minutes.append(diff)
+
+    delay_rate = delayed / total if total > 0 else 0
+    avg_delay = sum(delay_minutes) / len(delay_minutes) if delay_minutes else 0
+
+    if delay_rate >= AIRPORT_DELAY_RATE_HIGH:
+        situation = "大面积延误"
+    elif delay_rate >= AIRPORT_DELAY_RATE_MODERATE:
+        situation = "轻微拥堵"
+    else:
+        situation = "正常"
+
+    return {
+        "total": total,
+        "delayed": delayed,
+        "cancelled": cancelled,
+        "delay_rate": round(delay_rate, 3),
+        "avg_delay_min": round(avg_delay),
+        "situation": situation,
+    }
+
+
+# ============================================================
+# 信号 3: 飞常准AI预测
+# ============================================================
+
+def check_veryzhun_prediction(flight: dict) -> tuple[int, str | None]:
+    """
+    检查飞常准AI对该航班的延误预测。
+    返回 (预测延误分钟, 说明)
+    """
+    plan_dep = parse_time(flight.get("FlightDeptimePlanDate", ""))
+    vz_dep = parse_time(flight.get("VeryZhunReadyDeptimeDate", ""))
+    if not plan_dep or not vz_dep:
+        return 0, None
+    diff = (vz_dep - plan_dep).total_seconds() / 60
+    if diff >= 15:
+        return round(diff), f"飞常准AI预测延误{round(diff)}分钟"
+    return 0, None
+
+
+# ============================================================
+# 信号 4: 历史准点率
+# ============================================================
+
+def parse_ontime_rate(rate_str: str) -> float | None:
+    """解析准点率字符串 '86.67%' -> 86.67"""
+    if not rate_str:
+        return None
+    try:
+        return float(rate_str.replace("%", ""))
+    except ValueError:
+        return None
+
+
+# ============================================================
+# 综合延误风险判定
+# ============================================================
 
 def flight_not_yet_delayed(flight: dict) -> bool:
     """判断航班是否尚未发布航延通知"""
     state = flight.get("FlightState", "")
-    state_num = flight.get("FlightStateNum")
-
-    # 已经标记为延误/取消/备降的不算
-    if state in ("延误", "取消", "提前取消", "备降", "返航"):
+    if state in ("延误", "取消", "提前取消", "备降", "返航", "到达", "起飞"):
         return False
 
-    # 已经到达的不需要关注
-    if state == "到达":
-        return False
-
-    # 起飞状态：已经飞了，不再关注
-    if state == "起飞":
-        return False
-
-    # 检查出发时间是否已被调整（说明可能已发通知）
     plan_dep = parse_time(flight.get("FlightDeptimePlanDate", ""))
     ready_dep = parse_time(flight.get("FlightDeptimeReadyDate", ""))
     if plan_dep and ready_dep:
@@ -258,60 +459,187 @@ def flight_not_yet_delayed(flight: dict) -> bool:
     return True
 
 
-def analyze_delay_risk(departing: dict, inbound: dict) -> dict | None:
+def compute_risk_score(signals: dict) -> int:
     """
-    分析延误风险。
-    departing: 待出发的CZ航班
-    inbound: 该飞机的前序到达航班
-    返回风险分析结果，如果无风险返回 None
+    综合各信号计算延误风险总分 (0-100)。
     """
+    score = 0
+
+    # 前序延误 — 权重最高 (最多40分)
+    inbound_delay = signals.get("inbound_delay_min", 0)
+    if inbound_delay > 0:
+        dep_delay = signals.get("estimated_dep_delay_min", 0)
+        score += min(40, 15 + dep_delay)
+
+    # 天气 — 出发+到达 (最多25分)
+    dep_weather_score = signals.get("dep_weather_score", 0)
+    arr_weather_score = signals.get("arr_weather_score", 0)
+    score += min(25, (dep_weather_score + arr_weather_score) * 2)
+
+    # 机场态势 (最多15分)
+    delay_rate = signals.get("airport_delay_rate", 0)
+    if delay_rate >= AIRPORT_DELAY_RATE_HIGH:
+        score += 15
+    elif delay_rate >= AIRPORT_DELAY_RATE_MODERATE:
+        score += 8
+
+    # 飞常准AI预测 (最多15分)
+    vz_delay = signals.get("veryzhun_delay_min", 0)
+    if vz_delay >= 60:
+        score += 15
+    elif vz_delay >= 30:
+        score += 10
+    elif vz_delay >= 15:
+        score += 5
+
+    # 历史准点率 (最多5分)
+    ontime = signals.get("ontime_rate")
+    if ontime is not None and ontime < 70:
+        score += 5
+    elif ontime is not None and ontime < 80:
+        score += 3
+
+    return min(100, score)
+
+
+def analyze_comprehensive_risk(departing: dict, inbound: dict | None,
+                               airport_situation: dict,
+                               dep_weather_score: int,
+                               dep_weather_reasons: list,
+                               arr_weather_score: int,
+                               arr_weather_reasons: list) -> dict | None:
+    """
+    综合多维信号分析延误风险。
+    """
+    if not flight_not_yet_delayed(departing):
+        return None
+
     plan_dep = parse_time(departing.get("FlightDeptimePlanDate", ""))
     if not plan_dep:
         return None
 
-    inbound_arr = get_best_arrival_time(inbound)
-    inbound_plan_arr = parse_time(inbound.get("FlightArrtimePlanDate", ""))
-    if not inbound_arr or not inbound_plan_arr:
+    signals = {}
+    risk_reasons = []
+
+    # ---- 信号1: 前序航班延误 ----
+    inbound_delay_min = 0
+    estimated_dep_delay = 0
+    if inbound:
+        inbound_arr = get_best_arrival_time(inbound)
+        inbound_plan_arr = parse_time(inbound.get("FlightArrtimePlanDate", ""))
+        if inbound_arr and inbound_plan_arr:
+            inbound_delay_min = (inbound_arr - inbound_plan_arr).total_seconds() / 60
+            if inbound_delay_min >= SIGNIFICANT_DELAY_MINUTES:
+                turnaround = get_min_turnaround(departing.get("ftype", ""))
+                earliest_dep = inbound_arr + timedelta(minutes=turnaround)
+                estimated_dep_delay = (earliest_dep - plan_dep).total_seconds() / 60
+                if estimated_dep_delay > 0:
+                    risk_reasons.append(
+                        f"前序{inbound.get('FlightNo')}延误{round(inbound_delay_min)}分钟"
+                        f"→预估晚{round(estimated_dep_delay)}分钟")
+                else:
+                    inbound_delay_min = 0  # 过站时间够，不算风险
+
+    signals["inbound_delay_min"] = round(max(0, inbound_delay_min))
+    signals["estimated_dep_delay_min"] = round(max(0, estimated_dep_delay))
+
+    # ---- 信号2: 天气 ----
+    signals["dep_weather_score"] = dep_weather_score
+    signals["arr_weather_score"] = arr_weather_score
+    if dep_weather_reasons:
+        risk_reasons.append(f"出发机场: {', '.join(dep_weather_reasons)}")
+    # 到达机场天气从航班数据获取
+    arr_wx = parse_inline_weather(departing.get("ArrWeather", ""))
+    arr_s, arr_r = assess_weather_risk(arr_wx)
+    if arr_s > signals["arr_weather_score"]:
+        signals["arr_weather_score"] = arr_s
+    if arr_r:
+        risk_reasons.append(f"到达机场: {', '.join(arr_r)}")
+
+    # ---- 信号3: 飞常准AI预测 ----
+    vz_delay, vz_reason = check_veryzhun_prediction(departing)
+    signals["veryzhun_delay_min"] = vz_delay
+    if vz_reason:
+        risk_reasons.append(vz_reason)
+
+    # ---- 信号4: 机场态势 ----
+    signals["airport_delay_rate"] = airport_situation.get("delay_rate", 0)
+    if airport_situation.get("situation") == "大面积延误":
+        risk_reasons.append(
+            f"机场大面积延误(延误率{airport_situation['delay_rate']*100:.0f}%)")
+    elif airport_situation.get("situation") == "轻微拥堵":
+        risk_reasons.append(
+            f"机场轻微拥堵(延误率{airport_situation['delay_rate']*100:.0f}%)")
+
+    # ---- 信号5: 历史准点率 ----
+    ontime = parse_ontime_rate(departing.get("OntimeRate", ""))
+    signals["ontime_rate"] = ontime
+    if ontime is not None and ontime < 80:
+        risk_reasons.append(f"历史准点率仅{ontime}%")
+
+    # ---- 计算综合分 ----
+    total_score = compute_risk_score(signals)
+
+    # 过滤低风险（至少要有一个实质信号）
+    if total_score < 15:
         return None
 
-    # 前序航班延误了多少分钟
-    inbound_delay_min = (inbound_arr - inbound_plan_arr).total_seconds() / 60
+    # 风险等级
+    if total_score >= 70:
+        level = "极高"
+    elif total_score >= 50:
+        level = "高"
+    elif total_score >= 30:
+        level = "中"
+    else:
+        level = "低"
 
-    # 前序航班没有明显延误，跳过
-    if inbound_delay_min < SIGNIFICANT_DELAY_MINUTES:
-        return None
-
-    # 计算过站时间是否充足
-    turnaround = get_min_turnaround(departing.get("ftype", ""))
-    earliest_possible_dep = inbound_arr + timedelta(minutes=turnaround)
-    dep_delay_min = (earliest_possible_dep - plan_dep).total_seconds() / 60
-
-    # 如果过站后仍然能按时出发，不算风险
-    if dep_delay_min <= 0:
-        return None
-
-    # 确认当前航班未发布延误通知
-    if not flight_not_yet_delayed(departing):
-        return None
-
-    inbound_state = inbound.get("FlightState", "")
-    return {
+    result = {
         "departing_flight": departing.get("FlightNo"),
         "departing_route": f"{departing.get('FlightDepcode')}->{departing.get('FlightArrcode')}",
         "plan_departure": departing.get("FlightDeptimePlanDate"),
         "aircraft": departing.get("AircraftNumber"),
         "aircraft_type": departing.get("ftype", ""),
         "current_state": departing.get("FlightState", "计划"),
-        "inbound_flight": inbound.get("FlightNo"),
-        "inbound_route": f"{inbound.get('FlightDepcode')}->{inbound.get('FlightArrcode')}",
-        "inbound_plan_arrival": inbound.get("FlightArrtimePlanDate"),
-        "inbound_est_arrival": inbound_arr.strftime("%Y-%m-%d %H:%M:%S"),
-        "inbound_state": inbound_state,
-        "inbound_delay_min": round(inbound_delay_min),
-        "min_turnaround_min": turnaround,
-        "earliest_possible_dep": earliest_possible_dep.strftime("%Y-%m-%d %H:%M:%S"),
-        "estimated_dep_delay_min": round(dep_delay_min),
+        "risk_score": total_score,
+        "risk_level": level,
+        "risk_reasons": risk_reasons,
+        "signals": signals,
     }
+
+    # 前序航班详情
+    if inbound and inbound_delay_min >= SIGNIFICANT_DELAY_MINUTES:
+        result["inbound_flight"] = inbound.get("FlightNo")
+        result["inbound_route"] = (f"{inbound.get('FlightDepcode')}"
+                                   f"->{inbound.get('FlightArrcode')}")
+        result["inbound_state"] = inbound.get("FlightState", "")
+        result["inbound_plan_arrival"] = inbound.get("FlightArrtimePlanDate")
+        inbound_arr = get_best_arrival_time(inbound)
+        if inbound_arr:
+            result["inbound_est_arrival"] = inbound_arr.strftime(
+                "%Y-%m-%d %H:%M:%S")
+        result["inbound_delay_min"] = round(inbound_delay_min)
+        turnaround = get_min_turnaround(departing.get("ftype", ""))
+        result["min_turnaround_min"] = turnaround
+        if estimated_dep_delay > 0:
+            earliest = inbound_arr + timedelta(minutes=turnaround)
+            result["earliest_possible_dep"] = earliest.strftime(
+                "%Y-%m-%d %H:%M:%S")
+            result["estimated_dep_delay_min"] = round(estimated_dep_delay)
+
+    # 天气/准点率信息
+    dep_wx = parse_inline_weather(departing.get("DepWeather", ""))
+    if dep_wx:
+        result["dep_weather"] = departing.get("DepWeather")
+    arr_wx_str = departing.get("ArrWeather", "")
+    if arr_wx_str:
+        result["arr_weather"] = arr_wx_str
+    if ontime is not None:
+        result["ontime_rate"] = f"{ontime}%"
+    if vz_delay > 0:
+        result["veryzhun_predicted_delay"] = f"{vz_delay}分钟"
+
+    return result
 
 
 # ============================================================
@@ -326,9 +654,10 @@ def run_detection(api_key: str, date: str, hubs: dict,
     now = datetime.now()
 
     print(f"\n{'='*70}")
-    print(f"  南航前序航班延误检测器")
+    print(f"  南航航班延误智能检测器")
     print(f"  检测日期: {date}")
     print(f"  运行时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  检测信号: 前序延误 | 天气 | 机场态势 | AI预测 | 准点率")
     print(f"{'='*70}\n")
 
     all_risks = []
@@ -336,10 +665,23 @@ def run_detection(api_key: str, date: str, hubs: dict,
     for hub, destinations in hubs.items():
         print(f"[枢纽] {hub} — 正在检索航班数据...")
 
-        departing_flights = []   # 从hub出发的CZ航班
-        inbound_flights = []     # 到达hub的所有航班
+        # ---- 获取机场天气 (1次API调用) ----
+        weather_data = api.get_airport_weather(hub)
+        hub_weather_score, hub_weather_reasons = assess_airport_weather(
+            weather_data)
+        if hub_weather_reasons:
+            print(f"  [天气] {hub}: {', '.join(hub_weather_reasons)}")
+        elif verbose:
+            current = weather_data.get("current", {})
+            print(f"  [天气] {hub}: {current.get('Type', '未知')}"
+                  f" 能见度{current.get('Visib', '?')}m"
+                  f" {current.get('WindDirection', '')}{current.get('WindPower', '')}")
 
-        # 构建查询列表: 出港 + 进港
+        departing_flights = []
+        inbound_flights = []
+        all_hub_departures = []  # 所有出港航班（不限南航，用于机场态势）
+
+        # ---- 查询航线 ----
         route_tasks = []
         for dest in destinations:
             route_tasks.append(("out", hub, dest))
@@ -347,20 +689,19 @@ def run_detection(api_key: str, date: str, hubs: dict,
             route_tasks.append(("in", dest, hub))
 
         total = len(route_tasks)
-        print(f"  查询 {total} 条航线 (逐条请求以避免限速)...")
+        print(f"  查询 {total} 条航线...")
 
-        # 逐条顺序请求
         for i, (direction, dep, arr) in enumerate(route_tasks):
             flights = api.search_flights(dep, arr, date)
 
             if direction == "out":
+                all_hub_departures.extend(flights)
                 for fl in flights:
                     if fl.get("FlightNo", "").startswith("CZ"):
                         departing_flights.append(fl)
             else:
                 inbound_flights.extend(flights)
 
-            # 进度显示
             done = i + 1
             if done % 10 == 0 or done == total:
                 print(f"  进度: {done}/{total}  "
@@ -375,6 +716,15 @@ def run_detection(api_key: str, date: str, hubs: dict,
             print(f"  [注意] 有 {api.error_count} 次 API 请求失败，"
                   f"结果可能不完整")
 
+        # ---- 机场整体态势 ----
+        airport_sit = analyze_airport_situation(all_hub_departures)
+        sit_icon = {"正常": "✓", "轻微拥堵": "⚠", "大面积延误": "✗"}
+        print(f"  [态势] {hub}: {airport_sit['situation']} "
+              f"{sit_icon.get(airport_sit['situation'], '')}"
+              f"  (延误率{airport_sit['delay_rate']*100:.0f}%"
+              f" 取消{airport_sit['cancelled']}班"
+              f" 平均延误{airport_sit['avg_delay_min']}分钟)")
+
         # ---- 建立飞机注册号 -> 进港航班映射 ----
         aircraft_inbound = {}
         for fl in inbound_flights:
@@ -384,7 +734,6 @@ def run_detection(api_key: str, date: str, hubs: dict,
             arr_time = get_best_arrival_time(fl)
             if not arr_time:
                 continue
-            # 保留最晚到达的进港航班（即直接前序）
             if ac not in aircraft_inbound:
                 aircraft_inbound[ac] = fl
             else:
@@ -395,28 +744,44 @@ def run_detection(api_key: str, date: str, hubs: dict,
         if verbose:
             print(f"  已建立 {len(aircraft_inbound)} 架飞机的进港映射")
 
+        # ---- 收集目的地机场天气（从航班数据中提取，不额外调API） ----
+        dest_weather_cache = {}
+        for fl in departing_flights:
+            arr_code = fl.get("FlightArrcode", "")
+            if arr_code and arr_code not in dest_weather_cache:
+                arr_wx = parse_inline_weather(fl.get("ArrWeather", ""))
+                if arr_wx:
+                    dest_weather_cache[arr_code] = assess_weather_risk(arr_wx)
+
         # ---- 分析每个待出发CZ航班 ----
         candidates = 0
         for fl in departing_flights:
-            ac = fl.get("AircraftNumber", "").strip()
-            if not ac:
-                continue
-
-            # 只关注还没出发的航班
             state = fl.get("FlightState", "")
             if state in ("到达", "起飞"):
                 continue
 
-            inbound = aircraft_inbound.get(ac)
-            if not inbound:
-                continue
-
-            # 确保前序航班到达的机场和当前航班出发的机场一致
-            if inbound.get("FlightArrcode") != fl.get("FlightDepcode"):
-                continue
+            ac = fl.get("AircraftNumber", "").strip()
+            inbound = None
+            if ac:
+                inbound = aircraft_inbound.get(ac)
+                if inbound and inbound.get("FlightArrcode") != fl.get("FlightDepcode"):
+                    inbound = None
 
             candidates += 1
-            risk = analyze_delay_risk(fl, inbound)
+
+            # 出发机场天气：优先用航班内嵌数据，否则用API天气
+            dep_wx = parse_inline_weather(fl.get("DepWeather", ""))
+            if dep_wx:
+                dws, dwr = assess_weather_risk(dep_wx)
+            else:
+                dws, dwr = hub_weather_score, hub_weather_reasons
+
+            # 到达机场天气
+            arr_code = fl.get("FlightArrcode", "")
+            aws, awr = dest_weather_cache.get(arr_code, (0, []))
+
+            risk = analyze_comprehensive_risk(
+                fl, inbound, airport_sit, dws, dwr, aws, awr)
             if risk:
                 risk["hub"] = hub
                 all_risks.append(risk)
@@ -429,36 +794,61 @@ def run_detection(api_key: str, date: str, hubs: dict,
     # ---- 输出结果 ----
     print(f"{'='*70}")
     if not all_risks:
-        print("  未发现前序延误但未通知的南航航班 ✓")
+        print("  未发现高风险延误航班 ✓")
         print(f"{'='*70}\n")
         print(f"  (共发起 {api.call_count} 次 API 请求, "
               f"{api.error_count} 次失败)")
         return all_risks
 
-    # 按预估延误时间降序排列
-    all_risks.sort(key=lambda r: r["estimated_dep_delay_min"], reverse=True)
+    # 按风险分降序
+    all_risks.sort(key=lambda r: r["risk_score"], reverse=True)
 
-    print(f"  发现 {len(all_risks)} 个疑似前序延误但未发布通知的航班:")
+    print(f"  发现 {len(all_risks)} 个高风险延误航班（未发布延误通知）:")
     print(f"{'='*70}\n")
 
     for i, risk in enumerate(all_risks, 1):
-        print(f"  [{i}] {risk['departing_flight']}  "
+        level_badge = {"极高": "🔴", "高": "🟠", "中": "🟡", "低": "🟢"}
+        badge = level_badge.get(risk["risk_level"], "")
+
+        print(f"  [{i}] {badge} {risk['departing_flight']}  "
               f"{risk['departing_route']}  "
-              f"机型: {risk['aircraft_type']}  "
-              f"机号: {risk['aircraft']}")
+              f"风险: {risk['risk_level']}({risk['risk_score']}分)")
+        print(f"      机型: {risk['aircraft_type']}  "
+              f"机号: {risk.get('aircraft', 'N/A')}  "
+              f"状态: {risk['current_state']}")
         print(f"      计划出发: {risk['plan_departure']}")
-        print(f"      当前状态: {risk['current_state']}")
-        print(f"      ----")
-        print(f"      前序航班: {risk['inbound_flight']}  "
-              f"{risk['inbound_route']}  "
-              f"状态: {risk['inbound_state']}")
-        print(f"      前序计划到达: {risk['inbound_plan_arrival']}")
-        print(f"      前序预计到达: {risk['inbound_est_arrival']}")
-        print(f"      前序延误: {risk['inbound_delay_min']} 分钟")
-        print(f"      ----")
-        print(f"      最小过站时间: {risk['min_turnaround_min']} 分钟")
-        print(f"      最早可能出发: {risk['earliest_possible_dep']}")
-        print(f"      预估出发延误: ~{risk['estimated_dep_delay_min']} 分钟")
+
+        # 风险原因
+        if risk["risk_reasons"]:
+            print(f"      ---- 风险信号 ----")
+            for reason in risk["risk_reasons"]:
+                print(f"      • {reason}")
+
+        # 前序航班详情
+        if risk.get("inbound_flight"):
+            print(f"      ---- 前序航班 ----")
+            print(f"      {risk['inbound_flight']}  "
+                  f"{risk.get('inbound_route', '')}  "
+                  f"状态: {risk.get('inbound_state', '')}")
+            print(f"      计划到达: {risk.get('inbound_plan_arrival')}"
+                  f"  预计到达: {risk.get('inbound_est_arrival', '')}")
+            print(f"      前序延误: {risk.get('inbound_delay_min', 0)} 分钟"
+                  f"  →  最早可出发: "
+                  f"{risk.get('earliest_possible_dep', 'N/A')}")
+
+        # 补充信息
+        extras = []
+        if risk.get("ontime_rate"):
+            extras.append(f"准点率{risk['ontime_rate']}")
+        if risk.get("veryzhun_predicted_delay"):
+            extras.append(f"AI预测延误{risk['veryzhun_predicted_delay']}")
+        if risk.get("dep_weather"):
+            extras.append(f"出发天气: {risk['dep_weather']}")
+        if extras:
+            print(f"      ---- 参考 ----")
+            for e in extras:
+                print(f"      {e}")
+
         print()
 
     print(f"  (共发起 {api.call_count} 次 API 请求, "
@@ -474,16 +864,14 @@ def main():
     global SIGNIFICANT_DELAY_MINUTES, MIN_TURNAROUND_NARROW, MIN_TURNAROUND_WIDE
 
     parser = argparse.ArgumentParser(
-        description="南航前序航班延误检测器 — 找出前序已晚但航延通知未发的航班",
+        description="南航航班延误智能检测器 — 多维信号综合预判延误",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  %(prog)s                                      # 使用默认配置检测今天
-  %(prog)s --date 2026-02-21                    # 检测指定日期
-  %(prog)s --hub CAN                            # 仅检测广州枢纽
-  %(prog)s --hub CAN --dest PVG,PKX,CTU         # 自定义目的地
-  %(prog)s --threshold 20                       # 降低延误阈值到20分钟
-  %(prog)s --interval 1.0                       # 加大请求间隔避免限速
+  %(prog)s --auto-renew                           # 自动续杯模式
+  %(prog)s --hub CAN --dest PKX,PVG,CTU           # 精简扫描
+  %(prog)s --threshold 20                         # 降低延误阈值
+  %(prog)s --json                                 # JSON输出
         """,
     )
     parser.add_argument(
@@ -503,13 +891,13 @@ def main():
     )
     parser.add_argument(
         "--dest",
-        help="自定义目的地列表，逗号分隔 (覆盖默认目的地，与 --hub 配合使用)",
+        help="自定义目的地列表，逗号分隔",
     )
     parser.add_argument(
         "--turnaround",
         type=int,
         default=None,
-        help="自定义最小过站时间(分钟)，覆盖默认值",
+        help="自定义最小过站时间(分钟)",
     )
     parser.add_argument(
         "--threshold",
@@ -541,13 +929,11 @@ def main():
 
     args = parser.parse_args()
 
-    # 更新全局阈值
     SIGNIFICANT_DELAY_MINUTES = args.threshold
     if args.turnaround is not None:
         MIN_TURNAROUND_NARROW = args.turnaround
         MIN_TURNAROUND_WIDE = args.turnaround
 
-    # 确定枢纽和目的地
     if args.hub:
         if args.dest:
             destinations = [d.strip().upper() for d in args.dest.split(",")]
@@ -560,7 +946,6 @@ def main():
     else:
         hubs = CZ_HUBS
 
-    # 运行检测
     risks = run_detection(
         args.key, args.date, hubs,
         verbose=args.verbose, interval=args.interval,
