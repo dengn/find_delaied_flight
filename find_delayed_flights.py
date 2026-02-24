@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -35,6 +35,14 @@ from auto_renew_key import obtain_new_key
 # ============================================================
 
 API_URL = "https://mcp.variflight.com/api/v1/mcp/data"
+
+# 北京时间 UTC+8
+BJT = timezone(timedelta(hours=8))
+
+
+def beijing_now() -> datetime:
+    """返回当前北京时间（UTC+8），返回 naive datetime 以兼容 API 数据"""
+    return datetime.now(BJT).replace(tzinfo=None)
 
 # 南航主要枢纽及高频航线目的地
 CZ_HUBS = {
@@ -426,7 +434,7 @@ def run_detection(api_key: str, date: str, hubs: dict,
                   auto_renew: bool = False):
     """运行延误检测"""
     api = VariFlightAPI(api_key, interval=interval, auto_renew=auto_renew)
-    now = datetime.now()
+    now = beijing_now()
     tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     print(f"\n{'='*70}")
@@ -701,7 +709,7 @@ def build_email_html(hits: list) -> str:
         """
         rows.append(row)
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     html = f"""
     <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;">
     <div style="max-width:700px; margin:0 auto;">
@@ -787,7 +795,7 @@ def load_dedup_cache(filepath: str) -> dict:
     try:
         with open(filepath) as f:
             data = json.load(f)
-        now = datetime.now()
+        now = beijing_now()
         # 清理过期记录
         return {
             k: v for k, v in data.items()
@@ -811,7 +819,7 @@ def filter_new_hits(hits: list, cache: dict) -> list:
 
 def mark_notified(hits: list, cache: dict) -> dict:
     """标记航班为已通知"""
-    now = datetime.now().isoformat()
+    now = beijing_now().isoformat()
     for h in hits:
         cache[make_hit_key(h)] = now
     return cache
@@ -858,7 +866,7 @@ def monitor_loop(args, hubs: dict):
 
     while not stop_flag[0]:
         cycle_count += 1
-        now = datetime.now()
+        now = beijing_now()
 
         # 检查活跃时段
         current_hour = now.hour
@@ -988,7 +996,7 @@ def main():
     )
     parser.add_argument(
         "--date", "-d",
-        default=datetime.now().strftime("%Y-%m-%d"),
+        default=beijing_now().strftime("%Y-%m-%d"),
         help="查询日期 YYYY-MM-DD (默认今天)",
     )
     parser.add_argument(
