@@ -137,8 +137,12 @@ class VariFlightAPI:
                                     self.api_key = new_key
                                     self.session.headers["X-VARIFLIGHT-KEY"] = new_key
                                     self._balance_warned = False
-                                    print(f"  [续杯] 新 Key 已生效: {new_key[:20]}...\n",
+                                    print(f"  [续杯] 新 Key 已生效: {new_key[:20]}...",
                                           file=sys.stderr)
+                                    # 额度到账可能有延迟，多等一会再发请求
+                                    print("  [续杯] 等待 10s 确保额度生效...\n",
+                                          file=sys.stderr)
+                                    time.sleep(10)
                                     attempt = 0
                                     continue
                                 except Exception as e:

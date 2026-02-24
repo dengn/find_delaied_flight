@@ -172,14 +172,24 @@ def obtain_new_key(verbose: bool = True) -> str:
     api_key = create_api_key(token)
 
     log("[6/6] 等待额度到账...")
-    for i in range(6):
+    # 新账号额度到账可能有延迟，使用递增等待：5s, 10s, 15s, 20s, 25s, 30s, 30s, 30s, 30s, 30s
+    # 总等待时间最长约 225 秒（~3.75 分钟）
+    wait_intervals = [5, 10, 15, 20, 25, 30, 30, 30, 30, 30]
+    for i, wait in enumerate(wait_intervals):
         balance = check_balance(token)
         if balance > 0:
             log(f"       余额: {balance} ✓")
-            break
-        time.sleep(3)
+            return api_key
+        if i < len(wait_intervals) - 1:
+            log(f"       余额暂为 0，{wait}s 后第 {i+2} 次检查...")
+        time.sleep(wait)
+
+    # 最后一次检查
+    balance = check_balance(token)
+    if balance > 0:
+        log(f"       余额: {balance} ✓")
     else:
-        log(f"       余额仍为 0，可能需要更长时间到账")
+        log("       ⚠ 等待约 4 分钟后余额仍为 0，Key 可能暂时不可用")
 
     return api_key
 
