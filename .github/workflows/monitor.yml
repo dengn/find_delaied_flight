@@ -46,7 +46,7 @@ jobs:
       - name: Run detection
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          NOTIFY_EMAIL: '634897859@qq.com'
+          NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
         run: |
           HUB_ARG=""
           if [ -n "${{ github.event.inputs.hub }}" ]; then
