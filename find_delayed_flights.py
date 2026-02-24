@@ -471,6 +471,24 @@ def format_airport_weather(weather_data: dict) -> str:
             f"{current.get('Temperature', '?')}°C")
 
 
+def is_overdue_not_departed(flight: dict, now: datetime) -> bool:
+    """检查航班是否已过计划起飞时间但尚未实际起飞"""
+    plan_dep = parse_time(flight.get("FlightDeptimePlanDate", ""))
+    if not plan_dep:
+        return False
+    # 计划起飞时间尚未到达
+    if plan_dep >= now:
+        return False
+    # 已经实际起飞或到达了
+    state = flight.get("FlightState", "")
+    if state in ("起飞", "到达"):
+        return False
+    actual_dep = parse_time(flight.get("FlightDeptimeDate", ""))
+    if actual_dep:
+        return False
+    return True
+
+
 # ============================================================
 # 机场态势分析（辅助信息）
 # ============================================================
@@ -527,7 +545,8 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
     硬核分析：前序飞机到不了 → 后续航班铁定延误。
 
     必须同时满足以下条件才会产出结果：
-    1. 前序航班预计到达比计划晚 >= SIGNIFICANT_DELAY_MINUTES
+    1. 前序航班预计到达比计划晚 >= SIGNIFICANT_DELAY_MINUTES，
+       或前序航班已过计划起飞时间但尚未起飞
     2. 前序到达 + 过站时间 > 后续计划出发 (数学上来不及)
     3. 后续航班状态仍为"计划"（没发航变通知）
     4. 后续航班离现在 >= MIN_BOOKING_WINDOW_MINUTES (有时间买票)
@@ -554,14 +573,32 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
             return None
 
     # ---- 前序航班信息 ----
+    inbound_plan_dep = parse_time(inbound.get("FlightDeptimePlanDate", ""))
     inbound_plan_arr = parse_time(inbound.get("FlightArrtimePlanDate", ""))
     inbound_est_arr = get_best_arrival_time(inbound)
+    inbound_actual_dep = parse_time(inbound.get("FlightDeptimeDate", ""))
+    inbound_ready_dep = parse_time(inbound.get("FlightDeptimeReadyDate", ""))
+    inbound_ready_arr = parse_time(inbound.get("FlightArrtimeReadyDate", ""))
+    inbound_state = inbound.get("FlightState", "")
+
+    # ---- 新增检测：前序已过计划起飞时间但尚未起飞 ----
+    inbound_overdue = is_overdue_not_departed(inbound, now)
+    overdue_minutes = 0
+    if inbound_overdue and inbound_plan_dep:
+        overdue_minutes = round((now - inbound_plan_dep).total_seconds() / 60)
+        # 基于航程重新估算到达时间（最乐观假设：立刻起飞）
+        if inbound_plan_arr and inbound_plan_dep:
+            flight_duration = inbound_plan_arr - inbound_plan_dep
+            optimistic_arr = now + flight_duration
+            if not inbound_est_arr or optimistic_arr > inbound_est_arr:
+                inbound_est_arr = optimistic_arr
+
     if not inbound_plan_arr or not inbound_est_arr:
         return None
 
-    # 条件1: 前序航班明显延误
+    # 条件1: 前序航班明显延误 OR 前序已过起飞时间未起飞
     inbound_delay = (inbound_est_arr - inbound_plan_arr).total_seconds() / 60
-    if inbound_delay < SIGNIFICANT_DELAY_MINUTES:
+    if not inbound_overdue and inbound_delay < SIGNIFICANT_DELAY_MINUTES:
         return None
 
     # 条件2: 数学上来不及
@@ -572,10 +609,12 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
         return None  # 过站时间够，能赶上
 
     # ---- 全部条件满足，构建结果 ----
-    inbound_state = inbound.get("FlightState", "")
 
-    # 前序还没飞 → 延误更确定
-    if inbound_state in ("计划", "延误"):
+    # 确定性等级
+    if inbound_overdue:
+        certainty = (f"极高确定性 — 前序已超计划起飞时间"
+                     f"{overdue_minutes}分钟仍未起飞!")
+    elif inbound_state in ("计划", "延误"):
         certainty = "极高确定性（前序尚未起飞）"
     elif inbound_state == "起飞":
         certainty = "高确定性（前序在飞，预计到达已确定）"
@@ -589,6 +628,15 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
         vz_delay_min = max(0, round(
             (vz_dep - plan_dep).total_seconds() / 60))
 
+    # 后续航班完整时刻
+    plan_arr = parse_time(departing.get("FlightArrtimePlanDate", ""))
+    ready_arr = parse_time(departing.get("FlightArrtimeReadyDate", ""))
+    # 估算延误后的到达时间
+    estimated_arr = None
+    if plan_arr and plan_dep:
+        flight_duration = plan_arr - plan_dep
+        estimated_arr = earliest_possible_dep + flight_duration
+
     result = {
         # 后续航班（我们要买票的）
         "flight": departing.get("FlightNo"),
@@ -597,6 +645,7 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
         "dep_city": (f"{departing.get('FlightDep', '')}"
                      f" → {departing.get('FlightArr', '')}"),
         "plan_departure": departing.get("FlightDeptimePlanDate"),
+        "plan_arrival": departing.get("FlightArrtimePlanDate", ""),
         "current_state": state or "计划",
         "aircraft": departing.get("AircraftNumber"),
         "aircraft_type": departing.get("ftype", ""),
@@ -607,19 +656,40 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
         "estimated_delay_min": round(dep_delay),
         "earliest_possible_dep": earliest_possible_dep.strftime(
             "%Y-%m-%d %H:%M"),
+        "estimated_arrival": (estimated_arr.strftime("%Y-%m-%d %H:%M")
+                              if estimated_arr else ""),
         "certainty": certainty,
         "minutes_until_departure": round(minutes_until_dep),
+
+        # 航司调整时间（如已发布小幅航变）
+        "airline_adjusted_dep": (ready_dep.strftime("%Y-%m-%d %H:%M")
+                                 if ready_dep else ""),
+        "airline_adjusted_arr": (ready_arr.strftime("%Y-%m-%d %H:%M")
+                                 if ready_arr else ""),
 
         # 前序航班（导致延误的原因）
         "inbound_flight": inbound.get("FlightNo"),
         "inbound_route": (f"{inbound.get('FlightDepcode')}"
                           f" → {inbound.get('FlightArrcode')}"),
         "inbound_state": inbound_state,
+        "inbound_plan_dep": inbound.get("FlightDeptimePlanDate", ""),
         "inbound_plan_arrival": inbound.get("FlightArrtimePlanDate"),
+        "inbound_actual_dep": (inbound_actual_dep.strftime("%Y-%m-%d %H:%M")
+                               if inbound_actual_dep else ""),
         "inbound_est_arrival": inbound_est_arr.strftime("%Y-%m-%d %H:%M"),
         "inbound_delay_min": round(inbound_delay),
         "inbound_delay_reason": inbound.get("DelayReason", ""),
+        "inbound_airline_adjusted_dep": (
+            inbound_ready_dep.strftime("%Y-%m-%d %H:%M")
+            if inbound_ready_dep else ""),
+        "inbound_airline_adjusted_arr": (
+            inbound_ready_arr.strftime("%Y-%m-%d %H:%M")
+            if inbound_ready_arr else ""),
         "min_turnaround_min": turnaround,
+
+        # 优先级标记（前序超时未起飞）
+        "is_priority": inbound_overdue,
+        "inbound_overdue_min": overdue_minutes,
     }
 
     # 辅助信息
@@ -714,6 +784,10 @@ def run_detection(api_key: str, date: str, hubs: dict,
                 if delay >= SIGNIFICANT_DELAY_MINUTES:
                     delayed_aircraft.add(ac)
 
+            # 新增: 前序已过计划起飞时间但尚未起飞
+            if is_overdue_not_departed(fl, now):
+                delayed_aircraft.add(ac)
+
         if verbose:
             print(f"    飞机映射: {len(aircraft_inbound)} 架, "
                   f"延误>=30分: {len(delayed_aircraft)} 架")
@@ -724,14 +798,20 @@ def run_detection(api_key: str, date: str, hubs: dict,
                 fl = aircraft_inbound[ac]
                 est_arr = get_best_arrival_time(fl)
                 plan_arr = parse_time(fl.get("FlightArrtimePlanDate", ""))
-                delay = round((est_arr - plan_arr).total_seconds() / 60)
+                delay = round((est_arr - plan_arr).total_seconds() / 60) if (est_arr and plan_arr) else 0
+                overdue = is_overdue_not_departed(fl, now)
+                overdue_tag = ""
+                if overdue:
+                    pd = parse_time(fl.get("FlightDeptimePlanDate", ""))
+                    om = round((now - pd).total_seconds() / 60) if pd else 0
+                    overdue_tag = f" ⚠️超时{om}分钟未起飞!"
                 print(f"    {fl.get('FlightNo'):8s} "
                       f"{fl.get('FlightDepcode')}->{fl.get('FlightArrcode')} "
-                      f"计划到{plan_arr.strftime('%H:%M')} "
-                      f"预计到{est_arr.strftime('%H:%M')} "
+                      f"计划到{plan_arr.strftime('%H:%M') if plan_arr else '?'} "
+                      f"预计到{est_arr.strftime('%H:%M') if est_arr else '?'} "
                       f"晚{delay}分钟 "
                       f"状态:{fl.get('FlightState','')} "
-                      f"机号:{ac}")
+                      f"机号:{ac}{overdue_tag}")
 
         # ---- Step 2: 收集出港CZ航班（找受害航班）----
         # 扫描今天 + 明天（跨天场景）
@@ -851,10 +931,15 @@ def run_detection(api_key: str, date: str, hubs: dict,
               f"{api.error_count} 次失败)")
         return all_hits, summary
 
-    # 按预估延误时间降序
-    all_hits.sort(key=lambda h: h["estimated_delay_min"], reverse=True)
+    # 排序：优先级(前序超时未起飞)在前，然后按预估延误时间降序
+    all_hits.sort(key=lambda h: (h.get("is_priority", False),
+                                 h["estimated_delay_min"]),
+                  reverse=True)
 
+    priority_count = sum(1 for h in all_hits if h.get("is_priority"))
     print(f"  发现 {len(all_hits)} 个航变机会（航司未通知，可提前买里程票）:")
+    if priority_count:
+        print(f"  其中 {priority_count} 个为重点关注（前序超时未起飞）")
     print(f"{'='*70}\n")
 
     for i, hit in enumerate(all_hits, 1):
@@ -862,11 +947,14 @@ def run_detection(api_key: str, date: str, hubs: dict,
         mins_left = hit["minutes_until_departure"]
         hours_left = mins_left // 60
         mins_remain = mins_left % 60
+        is_priority = hit.get("is_priority", False)
 
+        priority_tag = " ⚠️ 重点关注" if is_priority else ""
         print(f"  ┌─[{i}] {hit['flight']}  "
-              f"{hit['route']}  ({hit['dep_city']})")
-        print(f"  │ 计划出发: {hit['plan_departure']}  "
-              f"(距现在 {hours_left}时{mins_remain}分)")
+              f"{hit['route']}  ({hit['dep_city']}){priority_tag}")
+        if is_priority:
+            print(f"  │ *** 前序航班已超计划起飞时间"
+                  f"{hit.get('inbound_overdue_min', 0)}分钟仍未起飞! ***")
         print(f"  │ 当前状态: {hit['current_state']}  ← 航司未通知航变!")
         print(f"  │ 机型: {hit['aircraft_type']}  "
               f"({hit.get('aircraft_model', '')})"
@@ -874,20 +962,41 @@ def run_detection(api_key: str, date: str, hubs: dict,
         if hit.get("terminal"):
             print(f"  │ 航站楼: {hit['terminal']}")
         print(f"  │")
+        print(f"  │ 后续航班时刻:")
+        print(f"  │   原定计划: "
+              f"起飞 {hit['plan_departure']}  →  "
+              f"到达 {hit.get('plan_arrival', '-')}")
+        if hit.get("airline_adjusted_dep") or hit.get("airline_adjusted_arr"):
+            print(f"  │   航司调整: "
+                  f"起飞 {hit.get('airline_adjusted_dep') or '-'}  →  "
+                  f"到达 {hit.get('airline_adjusted_arr') or '-'}")
+        print(f"  │   我们预估: "
+              f"起飞 {hit['earliest_possible_dep']}  →  "
+              f"到达 {hit.get('estimated_arrival') or '-'}")
+        print(f"  │   (距计划出发还有 {hours_left}时{mins_remain}分)")
+        print(f"  │")
         print(f"  │ ⛔ 预估延误: ~{delay} 分钟")
-        print(f"  │    最早可出发: {hit['earliest_possible_dep']}")
         print(f"  │    {hit['certainty']}")
         print(f"  │")
         print(f"  │ 前序航班: {hit['inbound_flight']}  "
               f"{hit['inbound_route']}  "
               f"状态: {hit['inbound_state']}")
-        print(f"  │    计划到达: {hit['inbound_plan_arrival']}")
-        print(f"  │    预计到达: {hit['inbound_est_arrival']}")
-        print(f"  │    延误: {hit['inbound_delay_min']} 分钟", end="")
+        print(f"  │   原定: "
+              f"起飞 {hit.get('inbound_plan_dep', '-')}  →  "
+              f"到达 {hit.get('inbound_plan_arrival', '-')}")
+        if hit.get("inbound_airline_adjusted_dep") or hit.get("inbound_airline_adjusted_arr"):
+            print(f"  │   航司调整: "
+                  f"起飞 {hit.get('inbound_airline_adjusted_dep') or '-'}  →  "
+                  f"到达 {hit.get('inbound_airline_adjusted_arr') or '-'}")
+        dep_info = hit.get("inbound_actual_dep") or "未起飞"
+        print(f"  │   实际/预计: "
+              f"起飞 {dep_info}  →  "
+              f"预计到达 {hit['inbound_est_arrival']}")
+        print(f"  │   延误: {hit['inbound_delay_min']} 分钟", end="")
         if hit.get("inbound_delay_reason"):
             print(f"  原因: {hit['inbound_delay_reason']}", end="")
         print()
-        print(f"  │    过站需: {hit['min_turnaround_min']} 分钟")
+        print(f"  │   过站需: {hit['min_turnaround_min']} 分钟")
 
         # 辅助信息
         extras = []
@@ -927,43 +1036,112 @@ def build_email_html(hits: list) -> str:
         mins_left = hit["minutes_until_departure"]
         hours_left = mins_left // 60
         mins_remain = mins_left % 60
+        is_priority = hit.get("is_priority", False)
+        overdue_min = hit.get("inbound_overdue_min", 0)
+
+        # 重点关注标签
+        priority_badge = ""
+        if is_priority:
+            priority_badge = (
+                '<div style="margin-top:6px;">'
+                '<span style="display:inline-block; padding:3px 10px; '
+                'background:#c0392b; color:white; border-radius:3px; '
+                'font-size:12px; font-weight:bold;">'
+                f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
+
+        header_bg = "#ffe0e0" if is_priority else "#fff3f3"
+
+        # 后续航班：航司调整时间行
+        airline_adjust_row = ""
+        if hit.get("airline_adjusted_dep") or hit.get("airline_adjusted_arr"):
+            adj_dep = hit.get("airline_adjusted_dep") or "-"
+            adj_arr = hit.get("airline_adjusted_arr") or "-"
+            airline_adjust_row = f"""
+        <tr><td style="padding:3px 12px 3px 28px; color:#e67e22;
+                font-size:13px;">航司调整</td>
+            <td style="padding:3px 12px; color:#e67e22; font-size:13px;">
+            起飞 {adj_dep} &rarr; 到达 {adj_arr}</td></tr>"""
+
+        # 前序航班：航司调整时间行
+        inbound_adjust_row = ""
+        if hit.get("inbound_airline_adjusted_dep") or hit.get("inbound_airline_adjusted_arr"):
+            iadj_dep = hit.get("inbound_airline_adjusted_dep") or "-"
+            iadj_arr = hit.get("inbound_airline_adjusted_arr") or "-"
+            inbound_adjust_row = f"""
+        <tr style="background:#f5f5f5;">
+          <td style="padding:3px 12px 3px 28px; color:#e67e22;
+                  font-size:13px;">航司调整</td>
+          <td style="padding:3px 12px; color:#e67e22; font-size:13px;">
+          起飞 {iadj_dep} &rarr; 到达 {iadj_arr}</td></tr>"""
+
+        # 前序实际起飞信息
+        inbound_dep_text = hit.get("inbound_actual_dep") or "未起飞"
 
         row = f"""
-        <tr style="border-bottom: 2px solid #e74c3c;">
-          <td colspan="2" style="padding:12px; background:#fff3f3;">
+        <tr style="border-bottom: 2px solid {'#c0392b' if is_priority else '#e74c3c'};">
+          <td colspan="2" style="padding:12px; background:{header_bg};">
             <h3 style="margin:0; color:#c0392b;">
               [{i}] {hit['flight']}  {hit['route']}  ({hit['dep_city']})
             </h3>
+            {priority_badge}
           </td>
         </tr>
-        <tr><td style="padding:6px 12px; color:#666;">计划出发</td>
-            <td style="padding:6px 12px;">{hit['plan_departure']}
-            (距现在 {hours_left}时{mins_remain}分)</td></tr>
         <tr><td style="padding:6px 12px; color:#666;">当前状态</td>
             <td style="padding:6px 12px; font-weight:bold; color:#e74c3c;">
-            {hit['current_state']} ← 航司未通知航变!</td></tr>
+            {hit['current_state']} &larr; 航司未通知航变!</td></tr>
         <tr><td style="padding:6px 12px; color:#666;">机型 / 机号</td>
             <td style="padding:6px 12px;">{hit['aircraft_type']}
             ({hit.get('aircraft_model','')}) / {hit['aircraft']}</td></tr>
+        <tr style="background:#f0f7ff;">
+          <td colspan="2" style="padding:8px 12px; font-weight:bold;
+                  color:#2c3e50; font-size:13px;">
+            ✈ 后续航班时刻 (距计划出发 {hours_left}时{mins_remain}分)</td></tr>
+        <tr><td style="padding:3px 12px 3px 28px; color:#666;
+                font-size:13px;">原定计划</td>
+            <td style="padding:3px 12px; font-size:13px;">
+            起飞 {hit['plan_departure']} &rarr;
+            到达 {hit.get('plan_arrival') or '-'}</td></tr>
+        {airline_adjust_row}
+        <tr><td style="padding:3px 12px 3px 28px; color:#c0392b;
+                font-weight:bold; font-size:13px;">我们预估</td>
+            <td style="padding:3px 12px; color:#c0392b; font-weight:bold;
+                font-size:13px;">
+            起飞 {hit['earliest_possible_dep']} &rarr;
+            到达 {hit.get('estimated_arrival') or '-'}</td></tr>
         <tr style="background:#fff8e1;">
           <td style="padding:6px 12px; color:#e65100; font-weight:bold;">
             预估延误</td>
           <td style="padding:6px 12px; color:#e65100; font-weight:bold;
               font-size:18px;">
             ~{delay} 分钟</td></tr>
-        <tr><td style="padding:6px 12px; color:#666;">最早可出发</td>
-            <td style="padding:6px 12px;">{hit['earliest_possible_dep']}</td></tr>
         <tr><td style="padding:6px 12px; color:#666;">确定性</td>
             <td style="padding:6px 12px;">{hit['certainty']}</td></tr>
+        <tr style="background:#f0f7ff;">
+          <td colspan="2" style="padding:8px 12px; font-weight:bold;
+                  color:#2c3e50; font-size:13px;">
+            ✈ 前序航班 {hit['inbound_flight']}
+            {hit['inbound_route']}
+            &nbsp; 状态: {hit['inbound_state']}</td></tr>
         <tr style="background:#f5f5f5;">
-          <td style="padding:6px 12px; color:#666;">前序航班</td>
-          <td style="padding:6px 12px;">{hit['inbound_flight']}
-            {hit['inbound_route']}  状态: {hit['inbound_state']}</td></tr>
+          <td style="padding:3px 12px 3px 28px; color:#666;
+                  font-size:13px;">原定计划</td>
+          <td style="padding:3px 12px; font-size:13px;">
+          起飞 {hit.get('inbound_plan_dep') or '-'} &rarr;
+          到达 {hit.get('inbound_plan_arrival') or '-'}</td></tr>
+        {inbound_adjust_row}
         <tr style="background:#f5f5f5;">
-          <td style="padding:6px 12px; color:#666;">前序延误</td>
-          <td style="padding:6px 12px;">{hit['inbound_delay_min']}分钟
-            (计划到{hit['inbound_plan_arrival']}
-            → 预计{hit['inbound_est_arrival']})</td></tr>
+          <td style="padding:3px 12px 3px 28px; color:#666;
+                  font-size:13px;">实际/预计</td>
+          <td style="padding:3px 12px; font-size:13px;">
+          起飞 {inbound_dep_text} &rarr;
+          预计到达 {hit['inbound_est_arrival']}</td></tr>
+        <tr style="background:#f5f5f5;">
+          <td style="padding:3px 12px 3px 28px; color:#666;
+                  font-size:13px;">延误/过站</td>
+          <td style="padding:3px 12px; font-size:13px;">
+          延误 {hit['inbound_delay_min']}分钟
+          {f" | 原因: {hit['inbound_delay_reason']}" if hit.get('inbound_delay_reason') else ""}
+          &nbsp;|&nbsp; 过站需 {hit['min_turnaround_min']}分钟</td></tr>
         <tr><td colspan="2" style="padding:8px 12px;">
           <a href="https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html"
              target="_blank"
@@ -1011,11 +1189,25 @@ def send_email(to_addr: str, resend_key: str, hits: list) -> bool:
     # 纯文本备用
     text_lines = []
     for i, hit in enumerate(hits, 1):
+        priority_tag = "[重点] " if hit.get("is_priority") else ""
         text_lines.append(
-            f"[{i}] {hit['flight']} {hit['route']} "
+            f"{priority_tag}[{i}] {hit['flight']} {hit['route']} "
             f"预估延误{hit['estimated_delay_min']}分钟 "
-            f"当前状态:{hit['current_state']} "
-            f"计划出发:{hit['plan_departure']}")
+            f"状态:{hit['current_state']}")
+        text_lines.append(
+            f"  原定: 起飞{hit['plan_departure']} → "
+            f"到达{hit.get('plan_arrival', '-')}")
+        if hit.get("airline_adjusted_dep") or hit.get("airline_adjusted_arr"):
+            text_lines.append(
+                f"  航司调整: 起飞{hit.get('airline_adjusted_dep') or '-'} → "
+                f"到达{hit.get('airline_adjusted_arr') or '-'}")
+        text_lines.append(
+            f"  预估: 起飞{hit['earliest_possible_dep']} → "
+            f"到达{hit.get('estimated_arrival') or '-'}")
+        text_lines.append(
+            f"  前序{hit['inbound_flight']} {hit['inbound_route']} "
+            f"状态:{hit['inbound_state']} 延误{hit['inbound_delay_min']}分")
+        text_lines.append("")
 
     try:
         resp = requests.post(
@@ -1114,31 +1306,86 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
             mins_left = hit["minutes_until_departure"]
             hours_left = mins_left // 60
             mins_remain = mins_left % 60
-            # 里程票查询链接
+            is_priority = hit.get("is_priority", False)
+            overdue_min = hit.get("inbound_overdue_min", 0)
             mileage_url = "https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html"
+
+            # 重点关注标签
+            priority_html = ""
+            if is_priority:
+                priority_html = (
+                    '<div style="margin-top:4px;">'
+                    '<span style="display:inline-block; padding:2px 8px; '
+                    'background:#c0392b; color:white; border-radius:3px; '
+                    'font-size:11px; font-weight:bold;">'
+                    f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
+
+            border_color = "#c0392b" if is_priority else "#e74c3c"
+            row_bg = "#ffe5e5" if is_priority else "#fff5f5"
+
+            # 后续航班航司调整
+            adj_line = ""
+            if hit.get("airline_adjusted_dep") or hit.get("airline_adjusted_arr"):
+                adj_dep = hit.get("airline_adjusted_dep") or "-"
+                adj_arr = hit.get("airline_adjusted_arr") or "-"
+                adj_line = (
+                    f'<br/><span style="color:#e67e22;">航司调整: '
+                    f'起飞 {adj_dep} &rarr; 到达 {adj_arr}</span>')
+
+            # 前序航班航司调整
+            inbound_adj_line = ""
+            if hit.get("inbound_airline_adjusted_dep") or hit.get("inbound_airline_adjusted_arr"):
+                iadj_dep = hit.get("inbound_airline_adjusted_dep") or "-"
+                iadj_arr = hit.get("inbound_airline_adjusted_arr") or "-"
+                inbound_adj_line = (
+                    f'<br/><span style="color:#e67e22;">航司调整: '
+                    f'起飞 {iadj_dep} &rarr; 到达 {iadj_arr}</span>')
+
+            inbound_dep_text = hit.get("inbound_actual_dep") or "未起飞"
+
             hit_rows.append(f"""
-            <tr style="border-left:4px solid #e74c3c; background:#fff5f5;">
+            <tr style="border-left:4px solid {border_color}; background:{row_bg};">
               <td style="padding:10px;" colspan="2">
                 <div style="font-weight:bold; color:#c0392b; font-size:15px;">
                   [{i}] {hit['flight']} &nbsp; {hit['route']}
                   &nbsp; ({hit['dep_city']})
                 </div>
-                <div style="margin-top:4px; font-size:13px;">
-                  计划出发 {hit['plan_departure']}
-                  (距现在 {hours_left}时{mins_remain}分)
-                  &nbsp;|&nbsp; 状态: {hit['current_state']}
-                  <strong style="color:#e74c3c;"> ← 航司未通知航变</strong>
-                </div>
-                <div style="margin-top:4px; font-size:13px;">
-                  预估延误 <strong style="color:#e74c3c; font-size:16px;">
+                {priority_html}
+                <div style="margin-top:6px; font-size:13px;">
+                  状态: <strong style="color:#e74c3c;">
+                  {hit['current_state']} &larr; 航司未通知航变</strong>
+                  &nbsp;|&nbsp; 预估延误
+                  <strong style="color:#e74c3c; font-size:15px;">
                   ~{delay}分钟</strong>
-                  &nbsp;|&nbsp; 前序: {hit['inbound_flight']}
-                  {hit['inbound_route']}
-                  晚{hit['inbound_delay_min']}分钟
+                </div>
+                <div style="margin-top:6px; padding:6px 8px;
+                        background:#f8f9fa; border-radius:4px;
+                        font-size:12px; line-height:1.6;">
+                  <b>后续航班时刻</b>
+                  (距计划出发 {hours_left}时{mins_remain}分)<br/>
+                  原定计划: 起飞 {hit['plan_departure']}
+                  &rarr; 到达 {hit.get('plan_arrival') or '-'}
+                  {adj_line}
+                  <br/><span style="color:#c0392b; font-weight:bold;">
+                  我们预估: 起飞 {hit['earliest_possible_dep']}
+                  &rarr; 到达 {hit.get('estimated_arrival') or '-'}</span>
+                </div>
+                <div style="margin-top:4px; padding:6px 8px;
+                        background:#f5f5f5; border-radius:4px;
+                        font-size:12px; line-height:1.6;">
+                  <b>前序 {hit['inbound_flight']}
+                  {hit['inbound_route']}</b>
+                  &nbsp; 状态: {hit['inbound_state']}<br/>
+                  原定计划: 起飞 {hit.get('inbound_plan_dep') or '-'}
+                  &rarr; 到达 {hit.get('inbound_plan_arrival') or '-'}
+                  {inbound_adj_line}
+                  <br/>实际/预计: 起飞 {inbound_dep_text}
+                  &rarr; 预计到达 {hit['inbound_est_arrival']}
+                  &nbsp;|&nbsp; 延误 {hit['inbound_delay_min']}分钟
+                  &nbsp;|&nbsp; 过站需 {hit['min_turnaround_min']}分钟
                 </div>
                 <div style="margin-top:4px; font-size:12px; color:#888;">
                   机号 {hit['aircraft']} &nbsp; 机型 {hit['aircraft_type']}
-                  &nbsp; 过站需 {hit['min_turnaround_min']}分钟
                 </div>
                 <div style="margin-top:8px;">
                   <a href="{mileage_url}" target="_blank"
@@ -1275,11 +1522,24 @@ def send_summary_email(to_addr: str, resend_key: str,
     if hits:
         text_lines.append(f"发现 {n_hits} 个航变机会:")
         for i, h in enumerate(hits, 1):
+            priority_tag = "[重点] " if h.get("is_priority") else ""
             text_lines.append(
-                f"  [{i}] {h['flight']} {h['route']} "
+                f"  {priority_tag}[{i}] {h['flight']} {h['route']} "
                 f"预延{h['estimated_delay_min']}分 "
-                f"状态:{h['current_state']} "
-                f"出发:{h['plan_departure']}")
+                f"状态:{h['current_state']}")
+            text_lines.append(
+                f"    原定: 起飞{h['plan_departure']} → "
+                f"到达{h.get('plan_arrival', '-')}")
+            if h.get("airline_adjusted_dep") or h.get("airline_adjusted_arr"):
+                text_lines.append(
+                    f"    航司调整: 起飞{h.get('airline_adjusted_dep') or '-'}"
+                    f" → 到达{h.get('airline_adjusted_arr') or '-'}")
+            text_lines.append(
+                f"    预估: 起飞{h['earliest_possible_dep']} → "
+                f"到达{h.get('estimated_arrival') or '-'}")
+            text_lines.append(
+                f"    前序{h['inbound_flight']} "
+                f"延误{h['inbound_delay_min']}分")
     else:
         text_lines.append("本轮未发现可操作的航变机会。")
 
