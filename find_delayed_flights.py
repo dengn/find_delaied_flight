@@ -432,7 +432,7 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
 def run_detection(api_key: str, date: str, hubs: dict,
                   verbose: bool = False, interval: float = REQUEST_INTERVAL,
                   auto_renew: bool = False):
-    """运行延误检测"""
+    """运行延误检测，返回 (hits, summary) 元组"""
     api = VariFlightAPI(api_key, interval=interval, auto_renew=auto_renew)
     now = beijing_now()
     tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -446,6 +446,14 @@ def run_detection(api_key: str, date: str, hubs: dict,
     print(f"{'='*70}\n")
 
     all_hits = []
+    # 汇总信息
+    summary = {
+        "date": date,
+        "run_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "hubs": {},
+        "api_calls": 0,
+        "api_errors": 0,
+    }
 
     for hub, destinations in hubs.items():
         print(f"[枢纽] {hub} — 正在检索航班数据...")
@@ -577,6 +585,31 @@ def run_detection(api_key: str, date: str, hubs: dict,
         if verbose:
             print(f"    检查了 {checked} 个航班")
 
+        # 收集该枢纽汇总
+        hub_hits = [h for h in all_hits if h.get("hub") == hub]
+        summary["hubs"][hub] = {
+            "weather": weather_text,
+            "inbound_total": len(inbound_flights),
+            "delayed_aircraft": len(delayed_aircraft),
+            "delayed_details": [],
+            "cz_departing": len(departing_cz),
+            "airport_situation": airport_sit,
+            "hits_count": len(hub_hits),
+        }
+        # 保存延误飞机详情
+        for ac in delayed_aircraft:
+            fl = aircraft_inbound[ac]
+            est_arr = get_best_arrival_time(fl)
+            plan_arr = parse_time(fl.get("FlightArrtimePlanDate", ""))
+            delay = round((est_arr - plan_arr).total_seconds() / 60) if (est_arr and plan_arr) else 0
+            summary["hubs"][hub]["delayed_details"].append({
+                "flight": fl.get("FlightNo", ""),
+                "route": f"{fl.get('FlightDepcode','')}->{fl.get('FlightArrcode','')}",
+                "delay_min": delay,
+                "aircraft": ac,
+                "state": fl.get("FlightState", ""),
+            })
+
         print()
 
     # ---- 输出结果 ----
@@ -590,9 +623,11 @@ def run_detection(api_key: str, date: str, hubs: dict,
         print("  - 受影响航班距出发不足2小时（来不及买票）")
         print("  - 深夜时段隔夜过站充裕，适合白天飞行高峰期运行")
         print(f"{'='*70}\n")
+        summary["api_calls"] = api.call_count
+        summary["api_errors"] = api.error_count
         print(f"  (共发起 {api.call_count} 次 API 请求, "
               f"{api.error_count} 次失败)")
-        return all_hits
+        return all_hits, summary
 
     # 按预估延误时间降序
     all_hits.sort(key=lambda h: h["estimated_delay_min"], reverse=True)
@@ -651,9 +686,11 @@ def run_detection(api_key: str, date: str, hubs: dict,
         print(f"  └─────────────────────────────────────")
         print()
 
+    summary["api_calls"] = api.call_count
+    summary["api_errors"] = api.error_count
     print(f"  (共发起 {api.call_count} 次 API 请求, "
           f"{api.error_count} 次失败)")
-    return all_hits
+    return all_hits, summary
 
 
 # ============================================================
@@ -768,6 +805,218 @@ def send_email(to_addr: str, resend_key: str, hits: list) -> bool:
         )
         if resp.status_code in (200, 201):
             print(f"  [邮件] 已通过 Resend 发送提醒到 {to_addr}", file=sys.stderr)
+            return True
+        else:
+            print(f"  [邮件失败] Resend 返回 {resp.status_code}: {resp.text}",
+                  file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"  [邮件失败] {e}", file=sys.stderr)
+        return False
+
+
+def build_summary_email_html(summary: dict, hits: list) -> str:
+    """构建每次运行的汇总邮件 HTML"""
+    now_str = summary.get("run_time", beijing_now().strftime("%Y-%m-%d %H:%M:%S"))
+    has_hits = len(hits) > 0
+
+    # 顶部 banner 颜色：有机会红色，无机会蓝色
+    banner_bg = "#c0392b" if has_hits else "#2c3e50"
+    banner_text = (f"发现 {len(hits)} 个航变机会!" if has_hits
+                   else "本轮未发现航变机会")
+
+    # 各枢纽扫描概况
+    hub_rows = []
+    for hub, info in summary.get("hubs", {}).items():
+        sit = info.get("airport_situation", {})
+        delay_rate = sit.get("delay_rate", 0) * 100
+        # 延误飞机列表
+        delayed_list = ""
+        for d in info.get("delayed_details", []):
+            color = "#e74c3c" if d["delay_min"] >= 60 else "#e67e22"
+            delayed_list += (
+                f'<span style="display:inline-block; margin:2px 4px; '
+                f'padding:2px 8px; background:{color}; color:white; '
+                f'border-radius:3px; font-size:12px;">'
+                f'{d["flight"]} {d["route"]} 晚{d["delay_min"]}分</span>'
+            )
+        if not delayed_list:
+            delayed_list = '<span style="color:#27ae60;">无严重延误</span>'
+
+        hub_rows.append(f"""
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:10px; font-weight:bold; font-size:16px;
+                     vertical-align:top;">{hub}</td>
+          <td style="padding:10px;">
+            <div style="margin-bottom:4px;">
+              <span style="color:#666;">天气:</span> {info.get('weather', 'N/A')}
+            </div>
+            <div style="margin-bottom:4px;">
+              <span style="color:#666;">进港航班:</span> {info.get('inbound_total', 0)} 个
+              &nbsp;|&nbsp;
+              <span style="color:#666;">南航出港:</span> {info.get('cz_departing', 0)} 个
+            </div>
+            <div style="margin-bottom:4px;">
+              <span style="color:#666;">机场态势:</span>
+              延误率 {delay_rate:.0f}%
+              &nbsp; 取消 {sit.get('cancelled', 0)} 班
+              &nbsp; 平均延误 {sit.get('avg_delay_min', 0)} 分钟
+            </div>
+            <div style="margin-bottom:4px;">
+              <span style="color:#666;">前序严重延误飞机:</span>
+              {info.get('delayed_aircraft', 0)} 架
+            </div>
+            <div>{delayed_list}</div>
+          </td>
+        </tr>""")
+
+    # 命中机会详情
+    hit_section = ""
+    if hits:
+        hit_rows = []
+        for i, hit in enumerate(hits, 1):
+            delay = hit["estimated_delay_min"]
+            mins_left = hit["minutes_until_departure"]
+            hours_left = mins_left // 60
+            mins_remain = mins_left % 60
+            hit_rows.append(f"""
+            <tr style="border-left:4px solid #e74c3c; background:#fff5f5;">
+              <td style="padding:10px;" colspan="2">
+                <div style="font-weight:bold; color:#c0392b; font-size:15px;">
+                  [{i}] {hit['flight']} &nbsp; {hit['route']}
+                </div>
+                <div style="margin-top:4px; font-size:13px;">
+                  计划出发 {hit['plan_departure']}
+                  (距现在 {hours_left}时{mins_remain}分)
+                  &nbsp;|&nbsp; 状态: {hit['current_state']}
+                  <strong style="color:#e74c3c;"> ← 航司未通知航变</strong>
+                </div>
+                <div style="margin-top:4px; font-size:13px;">
+                  预估延误 <strong style="color:#e74c3c; font-size:16px;">
+                  ~{delay}分钟</strong>
+                  &nbsp;|&nbsp; 前序: {hit['inbound_flight']}
+                  {hit['inbound_route']}
+                  晚{hit['inbound_delay_min']}分钟
+                </div>
+                <div style="margin-top:4px; font-size:12px; color:#888;">
+                  机号 {hit['aircraft']} &nbsp; 机型 {hit['aircraft_type']}
+                  &nbsp; 过站需 {hit['min_turnaround_min']}分钟
+                </div>
+              </td>
+            </tr>""")
+        hit_section = f"""
+        <div style="margin-top:16px;">
+          <h3 style="color:#c0392b; border-bottom:2px solid #e74c3c;
+                     padding-bottom:6px;">
+            航变机会详情
+          </h3>
+          <table style="width:100%; border-collapse:collapse; font-size:14px;">
+            {''.join(hit_rows)}
+          </table>
+        </div>"""
+
+    html = f"""
+    <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;
+                       background:#f5f5f5; padding:20px;">
+    <div style="max-width:700px; margin:0 auto; background:white;
+                border-radius:8px; overflow:hidden;
+                box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+      <div style="background:{banner_bg}; color:white; padding:20px;
+                  text-align:center;">
+        <h2 style="margin:0;">南航航变检测报告</h2>
+        <p style="margin:8px 0 0; font-size:14px; opacity:0.9;">
+          {now_str} &nbsp; | &nbsp; 检测日期: {summary.get('date', 'N/A')}
+        </p>
+      </div>
+
+      <div style="padding:16px; text-align:center;
+                  background:{'#fff3f3' if has_hits else '#f0f7ff'};">
+        <span style="font-size:22px; font-weight:bold;
+                     color:{banner_bg};">
+          {banner_text}
+        </span>
+      </div>
+
+      <div style="padding:16px;">
+        <h3 style="color:#2c3e50; border-bottom:2px solid #3498db;
+                   padding-bottom:6px;">
+          各枢纽扫描概况
+        </h3>
+        <table style="width:100%; border-collapse:collapse; font-size:14px;">
+          {''.join(hub_rows)}
+        </table>
+      </div>
+
+      {hit_section}
+
+      <div style="padding:12px 16px; background:#f9f9f9; color:#999;
+                  font-size:12px; text-align:center; border-top:1px solid #eee;">
+        API 请求 {summary.get('api_calls', 0)} 次
+        (失败 {summary.get('api_errors', 0)} 次)
+        &nbsp;|&nbsp; 南航航变机会检测器
+      </div>
+    </div>
+    </body></html>
+    """
+    return html
+
+
+def send_summary_email(to_addr: str, resend_key: str,
+                       summary: dict, hits: list) -> bool:
+    """每次运行后发送汇总邮件"""
+    n_hits = len(hits)
+    date = summary.get("date", "")
+    run_time = summary.get("run_time", "")
+    hub_names = ", ".join(summary.get("hubs", {}).keys())
+
+    if n_hits > 0:
+        subject = (f"[航变报告] {date} 发现 {n_hits} 个机会! "
+                   f"({hub_names})")
+    else:
+        subject = f"[航变报告] {date} {run_time} 未发现机会 ({hub_names})"
+
+    html = build_summary_email_html(summary, hits)
+
+    # 纯文本备用
+    text_lines = [f"南航航变检测报告 {run_time}", f"检测日期: {date}", ""]
+    for hub, info in summary.get("hubs", {}).items():
+        sit = info.get("airport_situation", {})
+        text_lines.append(
+            f"[{hub}] 进港{info.get('inbound_total',0)}班 "
+            f"南航出港{info.get('cz_departing',0)}班 "
+            f"延误飞机{info.get('delayed_aircraft',0)}架 "
+            f"延误率{sit.get('delay_rate',0)*100:.0f}% "
+            f"天气:{info.get('weather','N/A')}")
+    text_lines.append("")
+    if hits:
+        text_lines.append(f"发现 {n_hits} 个航变机会:")
+        for i, h in enumerate(hits, 1):
+            text_lines.append(
+                f"  [{i}] {h['flight']} {h['route']} "
+                f"预延{h['estimated_delay_min']}分 "
+                f"状态:{h['current_state']} "
+                f"出发:{h['plan_departure']}")
+    else:
+        text_lines.append("本轮未发现可操作的航变机会。")
+
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Flight Alert <onboarding@resend.dev>",
+                "to": [to_addr],
+                "subject": subject,
+                "html": html,
+                "text": "\n".join(text_lines),
+            },
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            print(f"  [邮件] 已发送汇总报告到 {to_addr}", file=sys.stderr)
             return True
         else:
             print(f"  [邮件失败] Resend 返回 {resp.status_code}: {resp.text}",
@@ -899,8 +1148,9 @@ def monitor_loop(args, hubs: dict):
             del notified[k]
 
         # 执行检测
+        summary = {}
         try:
-            hits = run_detection(
+            hits, summary = run_detection(
                 args.key, date, hubs,
                 verbose=args.verbose, interval=args.interval,
                 auto_renew=args.auto_renew,
@@ -908,6 +1158,10 @@ def monitor_loop(args, hubs: dict):
         except Exception as e:
             print(f"  [监控异常] {e}", file=sys.stderr)
             hits = []
+
+        # 每轮都发汇总邮件
+        if args.email and resend_key and summary:
+            send_summary_email(args.email, resend_key, summary, hits)
 
         # 过滤已通知的
         new_hits = filter_new_hits(hits, notified)
@@ -1133,23 +1387,23 @@ def main():
     dedup_file = args.dedup_file
     dedup_cache = load_dedup_cache(dedup_file) if dedup_file else {}
 
-    hits = run_detection(
+    hits, summary = run_detection(
         args.key, args.date, hubs,
         verbose=args.verbose, interval=args.interval,
         auto_renew=args.auto_renew,
     )
 
-    # 单次模式也支持邮件通知（CI 用）
-    if hits and args.email and args.resend_key:
-        new_hits = filter_new_hits(hits, dedup_cache) if dedup_file else hits
-        if new_hits:
-            print(f"\n  [通知] 发送 {len(new_hits)} 个新机会到 {args.email}...")
-            ok = send_email(args.email, args.resend_key, new_hits)
-            if ok and dedup_file:
+    # 每次运行都发汇总邮件
+    if args.email and args.resend_key:
+        print(f"\n  [通知] 发送汇总报告到 {args.email}...")
+        send_summary_email(args.email, args.resend_key, summary, hits)
+
+        # 如果有新机会，更新去重缓存
+        if hits and dedup_file:
+            new_hits = filter_new_hits(hits, dedup_cache)
+            if new_hits:
                 dedup_cache = mark_notified(new_hits, dedup_cache)
                 save_dedup_cache(dedup_file, dedup_cache)
-        elif dedup_file:
-            print(f"\n  [去重] 全部 {len(hits)} 个机会已通知过，跳过")
 
     if args.json:
         print(json.dumps(hits, ensure_ascii=False, indent=2))
