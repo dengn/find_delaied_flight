@@ -19,7 +19,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -54,6 +54,7 @@ jobs:
           fi
           python find_delayed_flights.py \
             --auto-renew \
+            --smart-scan \
             --email "$NOTIFY_EMAIL" \
             --dedup-file .notified_cache.json \
             --json \

@@ -22,6 +22,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -67,6 +68,203 @@ CZ_HUBS = {
         "CGO", "DLC", "SHE", "TAO", "HRB",
     ],
 }
+
+# 南航二线基地及常见航线（天气智能扫描时动态启用）
+CZ_SECONDARY_HUBS = {
+    "WUH": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "XIY", "HAK"],
+    "CSX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "NKG", "XIY", "HAK"],
+    "DLC": ["CAN", "PKX", "SZX", "PVG", "CSX", "CKG", "WUH", "HGH", "XIY"],
+    "CGO": ["CAN", "PKX", "SZX", "PVG", "HGH", "KMG", "CSX", "HAK", "XMN"],
+    "NKG": ["CAN", "PKX", "SZX", "CKG", "CSX", "WUH", "KMG", "XIY", "HAK", "SYX"],
+    "HGH": ["CAN", "PKX", "SZX", "CKG", "CSX", "WUH", "KMG", "XIY", "HAK"],
+    "KMG": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "NKG", "WUH"],
+    "XIY": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
+    "CKG": ["CAN", "PKX", "SZX", "PVG", "HGH", "NKG", "CSX", "KMG", "WUH", "HAK"],
+    "HAK": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO", "NKG"],
+    "SHE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
+    "TAO": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
+    "NNG": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK"],
+    "KWE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG"],
+    "HRB": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "XIY"],
+    "FOC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
+    "SYX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO"],
+    "TNA": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
+    "KHN": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
+    "LHW": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC"],
+    "HET": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX"],
+    "INC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY"],
+    "WNZ": ["CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG"],
+    "XMN": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
+    "TSN": ["CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
+}
+
+# 易受天气影响的小型/高原/偏远机场（纳入天气预扫描范围）
+WEATHER_SENSITIVE_AIRPORTS = [
+    "LJG", "JHG", "KWL", "YIH", "ENH", "TEN", "DIG", "ZAT",  # 西南山区
+    "KRL", "AKU", "HMI", "KRY", "HTN",                         # 新疆沙漠
+    "MIG", "JZH", "DLU", "TCZ", "BPX", "LXA",                  # 高原机场
+    "MDG", "YNJ", "YNT", "WEH", "RIZ",                         # 东北/沿海
+    "ZHA", "BHY", "AEB", "HPG", "JIU",                          # 华南/华中小场
+]
+
+# 天气风险关键词
+_WEATHER_HIGH_RISK = {"雷暴", "暴雨", "暴雪", "大暴雨", "冻雨", "沙尘暴", "大风"}
+_WEATHER_MED_RISK = {"大雨", "大雪", "中雪", "雾", "浓雾", "中雨", "扬沙", "霾"}
+_WEATHER_LOW_RISK = {"小雨", "小雪", "阵雨", "雨夹雪", "小到中雨", "小到中雪"}
+
+
+def score_weather_risk(weather_data: dict) -> int:
+    """为机场天气评估延误风险分数 (0-100)"""
+    if not weather_data:
+        return 0
+
+    score = 0
+    current = weather_data.get("current", {})
+    weather_type = str(current.get("Type", ""))
+
+    # 天气类型评分
+    for kw in _WEATHER_HIGH_RISK:
+        if kw in weather_type:
+            score += 60
+            break
+    else:
+        for kw in _WEATHER_MED_RISK:
+            if kw in weather_type:
+                score += 40
+                break
+        else:
+            for kw in _WEATHER_LOW_RISK:
+                if kw in weather_type:
+                    score += 15
+                    break
+
+    # 能见度评分
+    try:
+        vis = int(current.get("Visib", 9999))
+        if vis < 500:
+            score += 40
+        elif vis < 1000:
+            score += 30
+        elif vis < 3000:
+            score += 20
+        elif vis < 5000:
+            score += 10
+    except (ValueError, TypeError):
+        pass
+
+    # 风力评分
+    wind_str = str(current.get("WindPower", ""))
+    m = re.search(r"(\d+)", wind_str)
+    if m:
+        wind_val = int(m.group(1))
+        if wind_val >= 10:
+            score += 20
+        elif wind_val >= 7:
+            score += 10
+
+    return min(score, 100)
+
+
+def build_weather_smart_hubs(api, base_hubs: dict, verbose: bool = True) -> tuple:
+    """
+    基于天气预判构建智能扫描列表。
+    返回 (augmented_hubs, weather_report) 元组。
+    weather_report 是 {airport: (score, weather_summary)} 字典，供汇总邮件使用。
+    """
+    # 收集所有需要查天气的机场
+    airports_to_check = set()
+    for hub, dests in base_hubs.items():
+        airports_to_check.add(hub)
+        airports_to_check.update(dests)
+    for hub, dests in CZ_SECONDARY_HUBS.items():
+        airports_to_check.add(hub)
+        airports_to_check.update(dests)
+    airports_to_check.update(WEATHER_SENSITIVE_AIRPORTS)
+
+    if verbose:
+        print(f"\n  [天气预扫描] 正在检查 {len(airports_to_check)} 个机场天气...",
+              file=sys.stderr)
+
+    # 批量获取天气并评分
+    weather_scores = {}  # {airport: (score, weather_data)}
+    for airport in sorted(airports_to_check):
+        weather = api.get_airport_weather(airport)
+        sc = score_weather_risk(weather)
+        if sc > 0:
+            weather_scores[airport] = (sc, weather)
+
+    # 生成可读报告
+    weather_report = {}
+    for ap, (sc, wd) in weather_scores.items():
+        cur = wd.get("current", {})
+        summary = (f"{cur.get('Type', '?')} "
+                   f"能见度{cur.get('Visib', '?')}m "
+                   f"{cur.get('WindDirection', '')}{cur.get('WindPower', '')}")
+        weather_report[ap] = (sc, summary)
+
+    # 打印天气分析
+    if verbose:
+        bad = sorted(weather_scores.items(), key=lambda x: -x[1][0])
+        if bad:
+            print("  [天气预扫描] 恶劣天气机场 (风险分>=20):", file=sys.stderr)
+            for code, (sc, wd) in bad:
+                if sc < 20:
+                    break
+                cur = wd.get("current", {})
+                print(f"    {code}: {cur.get('Type','?')} "
+                      f"能见度{cur.get('Visib','?')}m  "
+                      f"风险分{sc}", file=sys.stderr)
+        else:
+            print("  [天气预扫描] 当前各机场天气良好", file=sys.stderr)
+
+    # 构建扩展扫描列表
+    smart_hubs = dict(base_hubs)  # 始终包含主枢纽
+
+    added_count = 0
+    max_add = 6  # 最多额外添加 6 个二线枢纽，控制 API 消耗
+
+    # 按天气风险降序排列二线枢纽
+    secondary_ranked = []
+    for hub, dests in CZ_SECONDARY_HUBS.items():
+        if hub in smart_hubs:
+            continue
+        hub_score = weather_scores.get(hub, (0,))[0]
+        # 计算目的地中有多少天气差的
+        bad_dest_scores = [weather_scores.get(d, (0,))[0] for d in dests]
+        bad_dest_count = sum(1 for s in bad_dest_scores if s >= 30)
+        # 综合评分：自身天气 + 目的地天气影响
+        combined = hub_score + bad_dest_count * 15
+        if combined >= 30:
+            secondary_ranked.append((hub, dests, combined, hub_score, bad_dest_count))
+
+    secondary_ranked.sort(key=lambda x: -x[2])
+
+    for hub, dests, combined, hub_score, bad_dest_count in secondary_ranked:
+        if added_count >= max_add:
+            break
+        smart_hubs[hub] = dests
+        added_count += 1
+        reason = []
+        if hub_score >= 30:
+            reason.append(f"本场天气差(分{hub_score})")
+        if bad_dest_count > 0:
+            reason.append(f"{bad_dest_count}个目的地天气差")
+        if verbose:
+            print(f"  [智能扫描] +{hub}  {'，'.join(reason)}", file=sys.stderr)
+
+    # 对所有枢纽，将天气差的目的地排到前面（优先扫描）
+    for hub in list(smart_hubs.keys()):
+        dests = smart_hubs[hub]
+        bad_first = sorted(dests,
+                           key=lambda d: -weather_scores.get(d, (0,))[0])
+        smart_hubs[hub] = bad_first
+
+    if verbose:
+        print(f"  [智能扫描] 最终扫描: {len(smart_hubs)} 个枢纽 "
+              f"(主站{len(base_hubs)} + 天气新增{added_count})\n", file=sys.stderr)
+
+    return smart_hubs, weather_report
+
 
 # 最小过站时间（分钟）
 MIN_TURNAROUND_NARROW = 45   # 窄体机
@@ -919,6 +1117,39 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
           </table>
         </div>"""
 
+    # 天气预扫描报告（智能扫描模式）
+    weather_section = ""
+    weather_prescan = summary.get("weather_prescan", {})
+    if weather_prescan:
+        # 筛选风险分>=20 的机场
+        risky = sorted(weather_prescan.items(), key=lambda x: -x[1][0])
+        risky = [(ap, sc, desc) for ap, (sc, desc) in risky if sc >= 20]
+        if risky:
+            wx_chips = []
+            for ap, sc, desc in risky:
+                if sc >= 50:
+                    bg = "#c0392b"
+                elif sc >= 30:
+                    bg = "#e67e22"
+                else:
+                    bg = "#f39c12"
+                wx_chips.append(
+                    f'<span style="display:inline-block; margin:2px 4px; '
+                    f'padding:3px 10px; background:{bg}; color:white; '
+                    f'border-radius:3px; font-size:12px;">'
+                    f'{ap} 分{sc} {desc}</span>')
+            weather_section = f"""
+      <div style="padding:16px;">
+        <h3 style="color:#e67e22; border-bottom:2px solid #f39c12;
+                   padding-bottom:6px;">
+          天气预扫描 (恶劣天气机场)
+        </h3>
+        <div style="font-size:13px; color:#666; margin-bottom:8px;">
+          基于天气风险评分动态扩展了扫描范围，以下机场天气可能导致航班延误：
+        </div>
+        <div>{''.join(wx_chips)}</div>
+      </div>"""
+
     html = f"""
     <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;
                        background:#f5f5f5; padding:20px;">
@@ -940,6 +1171,8 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
           {banner_text}
         </span>
       </div>
+
+      {weather_section}
 
       <div style="padding:16px;">
         <h3 style="color:#2c3e50; border-bottom:2px solid #3498db;
@@ -1305,6 +1538,11 @@ def main():
         action="store_true",
         help="余额不足时自动获取新 Key",
     )
+    parser.add_argument(
+        "--smart-scan",
+        action="store_true",
+        help="天气智能扫描：先预判各机场天气，自动加入天气差的二线机场",
+    )
 
     # ---- 通知相关 ----
     notify_group = parser.add_argument_group("邮件通知 (Resend API)")
@@ -1374,6 +1612,14 @@ def main():
     else:
         hubs = CZ_HUBS
 
+    # ---- 天气智能扫描：预判天气 → 动态扩展扫描范围 ----
+    weather_report = {}
+    if args.smart_scan:
+        prescan_api = VariFlightAPI(args.key, interval=args.interval,
+                                    auto_renew=args.auto_renew)
+        hubs, weather_report = build_weather_smart_hubs(
+            prescan_api, hubs, verbose=True)
+
     # ---- 持续监控模式 ----
     if args.monitor:
         if args.email and not args.resend_key:
@@ -1396,6 +1642,10 @@ def main():
         verbose=args.verbose, interval=args.interval,
         auto_renew=args.auto_renew,
     )
+
+    # 将天气预扫描报告加入汇总
+    if weather_report:
+        summary["weather_prescan"] = weather_report
 
     # 每次运行都发汇总邮件
     if args.email and args.resend_key:
