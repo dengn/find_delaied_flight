@@ -266,6 +266,17 @@ def build_weather_smart_hubs(api, base_hubs: dict, verbose: bool = True) -> tupl
     return smart_hubs, weather_report
 
 
+# 南航集团及生态航司 IATA 前缀
+# CZ=南航, XO=重庆航空(南航控股), TV=西藏航空(南航参股),
+# MF=厦门航空(南航控股), JD=首都航空(关联), GJ=长龙航空(关联)
+CZ_GROUP_PREFIXES = ("CZ", "XO", "MF")
+
+
+def is_cz_group_flight(flight_no: str) -> bool:
+    """判断是否为南航集团/生态航班"""
+    return flight_no.startswith(CZ_GROUP_PREFIXES)
+
+
 # 最小过站时间（分钟）
 MIN_TURNAROUND_NARROW = 45   # 窄体机
 MIN_TURNAROUND_WIDE = 70     # 宽体机
@@ -798,15 +809,24 @@ def run_detection(api_key: str, date: str, hubs: dict,
             "airport_situation": airport_sit,
             "hits_count": len(hub_hits),
         }
-        # 保存延误飞机详情
+        # 保存延误飞机详情（只保留南航集团航班）
         for ac in delayed_aircraft:
             fl = aircraft_inbound[ac]
+            fno = fl.get("FlightNo", "")
+            if not is_cz_group_flight(fno):
+                continue
             est_arr = get_best_arrival_time(fl)
             plan_arr = parse_time(fl.get("FlightArrtimePlanDate", ""))
+            plan_dep = parse_time(fl.get("FlightDeptimePlanDate", ""))
             delay = round((est_arr - plan_arr).total_seconds() / 60) if (est_arr and plan_arr) else 0
             summary["hubs"][hub]["delayed_details"].append({
-                "flight": fl.get("FlightNo", ""),
+                "flight": fno,
+                "dep": fl.get("FlightDepcode", ""),
+                "arr": fl.get("FlightArrcode", ""),
                 "route": f"{fl.get('FlightDepcode','')}->{fl.get('FlightArrcode','')}",
+                "plan_dep": plan_dep.strftime("%H:%M") if plan_dep else "",
+                "plan_arr": plan_arr.strftime("%H:%M") if plan_arr else "",
+                "est_arr": est_arr.strftime("%H:%M") if est_arr else "",
                 "delay_min": delay,
                 "aircraft": ac,
                 "state": fl.get("FlightState", ""),
@@ -944,6 +964,14 @@ def build_email_html(hits: list) -> str:
           <td style="padding:6px 12px;">{hit['inbound_delay_min']}分钟
             (计划到{hit['inbound_plan_arrival']}
             → 预计{hit['inbound_est_arrival']})</td></tr>
+        <tr><td colspan="2" style="padding:8px 12px;">
+          <a href="https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html"
+             target="_blank"
+             style="display:inline-block; padding:8px 20px;
+                    background:#1a73e8; color:white; font-size:14px;
+                    text-decoration:none; border-radius:4px;
+                    font-weight:bold;">
+            查询里程票</a></td></tr>
         <tr><td colspan="2" style="padding:4px;"></td></tr>
         """
         rows.append(row)
@@ -1032,15 +1060,21 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
     for hub, info in summary.get("hubs", {}).items():
         sit = info.get("airport_situation", {})
         delay_rate = sit.get("delay_rate", 0) * 100
-        # 延误飞机列表
+        # 延误飞机列表（仅南航集团航班）
         delayed_list = ""
         for d in info.get("delayed_details", []):
             color = "#e74c3c" if d["delay_min"] >= 60 else "#e67e22"
+            time_info = ""
+            if d.get("plan_dep"):
+                time_info = f' {d["plan_dep"]}出发'
+            if d.get("est_arr"):
+                time_info += f' 预计{d["est_arr"]}到'
             delayed_list += (
-                f'<span style="display:inline-block; margin:2px 4px; '
-                f'padding:2px 8px; background:{color}; color:white; '
-                f'border-radius:3px; font-size:12px;">'
-                f'{d["flight"]} {d["route"]} 晚{d["delay_min"]}分</span>'
+                f'<div style="display:inline-block; margin:3px 4px; '
+                f'padding:4px 10px; background:{color}; color:white; '
+                f'border-radius:4px; font-size:12px; line-height:1.4;">'
+                f'<b>{d["flight"]}</b> {d.get("dep","")}-&gt;{d.get("arr","")}'
+                f'{time_info} 晚{d["delay_min"]}分</div>'
             )
         if not delayed_list:
             delayed_list = '<span style="color:#27ae60;">无严重延误</span>'
@@ -1065,8 +1099,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
               &nbsp; 平均延误 {sit.get('avg_delay_min', 0)} 分钟
             </div>
             <div style="margin-bottom:4px;">
-              <span style="color:#666;">前序严重延误飞机:</span>
-              {info.get('delayed_aircraft', 0)} 架
+              <span style="color:#666;">南航集团严重延误进港:</span>
             </div>
             <div>{delayed_list}</div>
           </td>
@@ -1081,11 +1114,14 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
             mins_left = hit["minutes_until_departure"]
             hours_left = mins_left // 60
             mins_remain = mins_left % 60
+            # 里程票查询链接
+            mileage_url = "https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html"
             hit_rows.append(f"""
             <tr style="border-left:4px solid #e74c3c; background:#fff5f5;">
               <td style="padding:10px;" colspan="2">
                 <div style="font-weight:bold; color:#c0392b; font-size:15px;">
                   [{i}] {hit['flight']} &nbsp; {hit['route']}
+                  &nbsp; ({hit['dep_city']})
                 </div>
                 <div style="margin-top:4px; font-size:13px;">
                   计划出发 {hit['plan_departure']}
@@ -1103,6 +1139,13 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                 <div style="margin-top:4px; font-size:12px; color:#888;">
                   机号 {hit['aircraft']} &nbsp; 机型 {hit['aircraft_type']}
                   &nbsp; 过站需 {hit['min_turnaround_min']}分钟
+                </div>
+                <div style="margin-top:8px;">
+                  <a href="{mileage_url}" target="_blank"
+                     style="display:inline-block; padding:6px 16px;
+                            background:#1a73e8; color:white; font-size:13px;
+                            text-decoration:none; border-radius:4px;">
+                    查询里程票</a>
                 </div>
               </td>
             </tr>""")
@@ -1221,9 +1264,13 @@ def send_summary_email(to_addr: str, resend_key: str,
         text_lines.append(
             f"[{hub}] 进港{info.get('inbound_total',0)}班 "
             f"南航出港{info.get('cz_departing',0)}班 "
-            f"延误飞机{info.get('delayed_aircraft',0)}架 "
             f"延误率{sit.get('delay_rate',0)*100:.0f}% "
             f"天气:{info.get('weather','N/A')}")
+        for d in info.get("delayed_details", []):
+            text_lines.append(
+                f"  {d['flight']} {d.get('dep','')}->{d.get('arr','')} "
+                f"{d.get('plan_dep','')}出发 预计{d.get('est_arr','')}到 "
+                f"晚{d['delay_min']}分")
     text_lines.append("")
     if hits:
         text_lines.append(f"发现 {n_hits} 个航变机会:")
