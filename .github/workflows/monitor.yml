@@ -1,0 +1,53 @@
+name: Flight Delay Monitor
+
+on:
+  schedule:
+    # 北京时间 07:00-22:30，每30分钟运行一次
+    # 北京 = UTC+8，所以 07:00 BJT = 23:00 UTC (前一天)
+    # 22:30 BJT = 14:30 UTC
+    # 覆盖 UTC 23:00-14:30
+    - cron: '0,30 23,0-14 * * *'
+
+  # 支持手动触发（测试用）
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 恢复去重缓存（跨运行持久化）
+      - name: Restore dedup cache
+        uses: actions/cache@v4
+        with:
+          path: .notified_cache.json
+          key: dedup-${{ github.run_id }}
+          restore-keys: dedup-
+
+      # 运行检测 + 自动邮件通知
+      - name: Run detection
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAIL: '634897859@qq.com'
+        run: |
+          python find_delayed_flights.py \
+            --auto-renew \
+            --email "$NOTIFY_EMAIL" \
+            --dedup-file .notified_cache.json \
+            --json \
+            2>&1 || true
+          # exit 0: 无机会; exit 1: 有机会 (已通过邮件通知)
+          # || true: 无论结果如何都继续（保存缓存）

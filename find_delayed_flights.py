@@ -21,12 +21,10 @@
 
 import argparse
 import json
-import smtplib
+import os
 import sys
 import time
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import requests
 
@@ -651,7 +649,7 @@ def run_detection(api_key: str, date: str, hubs: dict,
 
 
 # ============================================================
-# 邮件通知
+# 邮件通知 (Resend API)
 # ============================================================
 
 def build_email_html(hits: list) -> str:
@@ -729,18 +727,11 @@ def build_email_html(hits: list) -> str:
     return html
 
 
-def send_email(to_addr: str, smtp_pass: str, hits: list,
-               smtp_host: str = "smtp.qq.com", smtp_port: int = 465,
-               from_addr: str = None) -> bool:
-    """通过 QQ 邮箱发送航变提醒邮件"""
-    if from_addr is None:
-        from_addr = to_addr  # 默认自己给自己发
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = (f"[航变提醒] 发现 {len(hits)} 个机会! "
-                      f"{hits[0]['flight']} 预延{hits[0]['estimated_delay_min']}分钟")
-    msg["From"] = f"航变检测器 <{from_addr}>"
-    msg["To"] = to_addr
+def send_email(to_addr: str, resend_key: str, hits: list) -> bool:
+    """通过 Resend API 发送航变提醒邮件（免授权码）"""
+    subject = (f"[航变提醒] 发现 {len(hits)} 个机会! "
+               f"{hits[0]['flight']} 预延{hits[0]['estimated_delay_min']}分钟")
+    html = build_email_html(hits)
 
     # 纯文本备用
     text_lines = []
@@ -750,40 +741,99 @@ def send_email(to_addr: str, smtp_pass: str, hits: list,
             f"预估延误{hit['estimated_delay_min']}分钟 "
             f"当前状态:{hit['current_state']} "
             f"计划出发:{hit['plan_departure']}")
-    msg.attach(MIMEText("\n".join(text_lines), "plain", "utf-8"))
-
-    # HTML 正文
-    html = build_email_html(hits)
-    msg.attach(MIMEText(html, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as server:
-            server.login(from_addr, smtp_pass)
-            server.sendmail(from_addr, [to_addr], msg.as_string())
-        print(f"  [邮件] 已发送提醒到 {to_addr}", file=sys.stderr)
-        return True
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Flight Alert <onboarding@resend.dev>",
+                "to": [to_addr],
+                "subject": subject,
+                "html": html,
+                "text": "\n".join(text_lines),
+            },
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            print(f"  [邮件] 已通过 Resend 发送提醒到 {to_addr}", file=sys.stderr)
+            return True
+        else:
+            print(f"  [邮件失败] Resend 返回 {resp.status_code}: {resp.text}",
+                  file=sys.stderr)
+            return False
     except Exception as e:
         print(f"  [邮件失败] {e}", file=sys.stderr)
         return False
 
 
 # ============================================================
-# 持续监控
+# 去重缓存（跨运行持久化）
 # ============================================================
 
+DEDUP_HOURS = 6  # 同一航班 6 小时内不重复通知
+
+
 def make_hit_key(hit: dict) -> str:
-    """生成航班唯一标识，用于去重"""
+    """生成航班唯一标识"""
     return f"{hit['flight']}|{hit['plan_departure']}|{hit['aircraft']}"
 
+
+def load_dedup_cache(filepath: str) -> dict:
+    """从 JSON 文件加载去重记录"""
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+        now = datetime.now()
+        # 清理过期记录
+        return {
+            k: v for k, v in data.items()
+            if (now - datetime.fromisoformat(v)).total_seconds()
+            < DEDUP_HOURS * 3600
+        }
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def save_dedup_cache(filepath: str, cache: dict):
+    """保存去重记录到 JSON 文件"""
+    with open(filepath, "w") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def filter_new_hits(hits: list, cache: dict) -> list:
+    """过滤已通知过的航班，返回新发现"""
+    return [h for h in hits if make_hit_key(h) not in cache]
+
+
+def mark_notified(hits: list, cache: dict) -> dict:
+    """标记航班为已通知"""
+    now = datetime.now().isoformat()
+    for h in hits:
+        cache[make_hit_key(h)] = now
+    return cache
+
+
+# ============================================================
+# 持续监控
+# ============================================================
 
 def monitor_loop(args, hubs: dict):
     """持续监控主循环"""
     import signal
 
     cycle_min = args.cycle
-    notified = {}  # key -> last_notified_time
-    # 通知去重有效期（小时），超过后同一航班可再次通知
-    DEDUP_HOURS = 6
+    resend_key = args.resend_key
+
+    # 去重缓存：优先用文件持久化，否则纯内存
+    dedup_file = args.dedup_file
+    if dedup_file:
+        notified = load_dedup_cache(dedup_file)
+    else:
+        notified = {}
 
     stop_flag = [False]
 
@@ -802,6 +852,7 @@ def monitor_loop(args, hubs: dict):
     print(f"  监控周期: 每 {cycle_min} 分钟")
     print(f"  通知邮箱: {args.email}")
     print(f"  活跃时段: {args.active_start}:00 - {args.active_end}:00")
+    print(f"  通知方式: Resend API")
     print(f"  按 Ctrl+C 安全退出")
     print(f"{'='*70}\n")
 
@@ -812,7 +863,8 @@ def monitor_loop(args, hubs: dict):
         # 检查活跃时段
         current_hour = now.hour
         if not (args.active_start <= current_hour < args.active_end):
-            next_active = now.replace(hour=args.active_start, minute=0, second=0)
+            next_active = now.replace(hour=args.active_start, minute=0,
+                                      second=0)
             if current_hour >= args.active_end:
                 next_active += timedelta(days=1)
             wait_sec = (next_active - now).total_seconds()
@@ -820,7 +872,6 @@ def monitor_loop(args, hubs: dict):
             print(f"  [{now.strftime('%H:%M')}] 非活跃时段 "
                   f"({args.active_start}:00-{args.active_end}:00), "
                   f"休眠 {wait_hr:.1f} 小时后自动恢复...")
-            # 分段休眠以便响应中断信号
             while wait_sec > 0 and not stop_flag[0]:
                 time.sleep(min(wait_sec, 60))
                 wait_sec -= 60
@@ -828,15 +879,15 @@ def monitor_loop(args, hubs: dict):
 
         print(f"\n  [{now.strftime('%H:%M:%S')}] === 第 {cycle_count} 轮监控 ===")
 
-        # 更新日期
         date = now.strftime("%Y-%m-%d")
 
         # 清理过期去重记录
-        expired_keys = [
-            k for k, t in notified.items()
-            if (now - t).total_seconds() > DEDUP_HOURS * 3600
+        expired = [
+            k for k, v in notified.items()
+            if (now - datetime.fromisoformat(v)).total_seconds()
+            > DEDUP_HOURS * 3600
         ]
-        for k in expired_keys:
+        for k in expired:
             del notified[k]
 
         # 执行检测
@@ -851,36 +902,32 @@ def monitor_loop(args, hubs: dict):
             hits = []
 
         # 过滤已通知的
-        new_hits = []
-        for hit in hits:
-            key = make_hit_key(hit)
-            if key not in notified:
-                new_hits.append(hit)
+        new_hits = filter_new_hits(hits, notified)
 
         if new_hits:
             total_hits_found += len(new_hits)
             print(f"\n  [新发现] {len(new_hits)} 个新机会 "
-                  f"(本轮共{len(hits)}个, 已通知过{len(hits)-len(new_hits)}个)")
+                  f"(本轮共{len(hits)}个, "
+                  f"已通知过{len(hits)-len(new_hits)}个)")
 
-            # 发送邮件
-            if args.email and args.smtp_pass:
-                ok = send_email(args.email, args.smtp_pass, new_hits,
-                                from_addr=args.smtp_from)
+            if args.email and resend_key:
+                ok = send_email(args.email, resend_key, new_hits)
                 if ok:
-                    for hit in new_hits:
-                        notified[make_hit_key(hit)] = now
+                    notified = mark_notified(new_hits, notified)
             else:
-                print(f"  [注意] 未配置邮箱授权码(--smtp-pass)，跳过邮件发送",
+                print(f"  [注意] 未配置 Resend Key (--resend-key)，跳过邮件",
                       file=sys.stderr)
-                for hit in new_hits:
-                    notified[make_hit_key(hit)] = now
+                notified = mark_notified(new_hits, notified)
         else:
             if hits:
                 print(f"  [本轮] {len(hits)} 个机会均已通知过，不重复发送")
             else:
                 print(f"  [本轮] 未发现新机会")
 
-        # 统计
+        # 持久化去重缓存
+        if dedup_file:
+            save_dedup_cache(dedup_file, notified)
+
         print(f"  [统计] 已运行 {cycle_count} 轮, "
               f"累计发现 {total_hits_found} 个新机会, "
               f"去重池 {len(notified)} 条")
@@ -888,12 +935,15 @@ def monitor_loop(args, hubs: dict):
         if stop_flag[0]:
             break
 
-        # 等待下一周期
         print(f"  [休眠] {cycle_min} 分钟后进行下一轮检测...")
         wait_sec = cycle_min * 60
         while wait_sec > 0 and not stop_flag[0]:
             time.sleep(min(wait_sec, 10))
             wait_sec -= 10
+
+    # 退出前保存
+    if dedup_file:
+        save_dedup_cache(dedup_file, notified)
 
     print(f"\n  [监控结束] 共运行 {cycle_count} 轮, "
           f"发现 {total_hits_found} 个新机会")
@@ -916,16 +966,19 @@ def main():
   但航司尚未发布航变通知 → 此时可以买里程票 → 等航变后免费改签/退票
 
 示例:
-  %(prog)s --auto-renew                      # 单次扫描，自动续杯
-  %(prog)s --hub CAN                         # 只扫描广州枢纽
-  %(prog)s --hub CAN --dest PKX,PVG,CTU      # 精简扫描指定航线
-  %(prog)s --threshold 20                    # 降低前序延误阈值到20分钟
-  %(prog)s --json                            # JSON输出（便于程序处理）
+  %(prog)s --auto-renew                          # 单次扫描
+  %(prog)s --hub CAN --dest PKX,PVG,CTU          # 指定枢纽和航线
 
-  # 持续监控模式 (每15分钟扫描，有结果邮件通知):
-  %(prog)s --monitor --email 634897859@qq.com --smtp-pass YOUR_AUTH_CODE --auto-renew
-  %(prog)s --monitor --cycle 10 --email x@qq.com --smtp-pass CODE  # 10分钟一轮
-  %(prog)s --monitor --active-start 8 --active-end 22              # 自定义活跃时段
+  # 单次扫描 + 邮件通知:
+  %(prog)s --auto-renew --email 634897859@qq.com --resend-key re_xxx
+
+  # 持续监控模式:
+  %(prog)s --monitor --email 634897859@qq.com --resend-key re_xxx --auto-renew
+  %(prog)s --monitor --cycle 10 --active-start 8 --active-end 22  # 自定义
+
+  # GitHub CI 模式 (使用环境变量 + 去重文件):
+  RESEND_API_KEY=re_xxx python %(prog)s --auto-renew --email 634897859@qq.com \\
+    --dedup-file .notified_cache.json --json
         """,
     )
     parser.add_argument(
@@ -987,6 +1040,24 @@ def main():
         help="余额不足时自动获取新 Key",
     )
 
+    # ---- 通知相关 ----
+    notify_group = parser.add_argument_group("邮件通知 (Resend API)")
+    notify_group.add_argument(
+        "--email",
+        default=None,
+        help="通知邮箱地址 (例: 634897859@qq.com)",
+    )
+    notify_group.add_argument(
+        "--resend-key",
+        default=None,
+        help="Resend API Key (也可通过环境变量 RESEND_API_KEY 设置)",
+    )
+    notify_group.add_argument(
+        "--dedup-file",
+        default=None,
+        help="去重缓存文件路径 (CI模式用，跨运行持久化去重记录)",
+    )
+
     # ---- 持续监控相关 ----
     monitor_group = parser.add_argument_group("持续监控模式")
     monitor_group.add_argument(
@@ -1001,34 +1072,23 @@ def main():
         help="监控周期(分钟)，默认 15",
     )
     monitor_group.add_argument(
-        "--email",
-        default=None,
-        help="通知邮箱地址 (例: 634897859@qq.com)",
-    )
-    monitor_group.add_argument(
-        "--smtp-pass",
-        default=None,
-        help="邮箱 SMTP 授权码 (QQ邮箱需在设置中开启SMTP并生成授权码)",
-    )
-    monitor_group.add_argument(
-        "--smtp-from",
-        default=None,
-        help="发件人邮箱 (默认与收件人相同，自己给自己发)",
-    )
-    monitor_group.add_argument(
         "--active-start",
         type=int,
         default=7,
-        help="活跃监控开始时间(整点, 0-23)，默认 7 (早7点)",
+        help="活跃监控开始时间(整点, 0-23)，默认 7",
     )
     monitor_group.add_argument(
         "--active-end",
         type=int,
         default=23,
-        help="活跃监控结束时间(整点, 0-23)，默认 23 (晚11点)",
+        help="活跃监控结束时间(整点, 0-23)，默认 23",
     )
 
     args = parser.parse_args()
+
+    # Resend Key: CLI 参数 > 环境变量
+    if not args.resend_key:
+        args.resend_key = os.environ.get("RESEND_API_KEY")
 
     SIGNIFICANT_DELAY_MINUTES = args.threshold
     MIN_BOOKING_WINDOW_MINUTES = args.booking_window
@@ -1050,21 +1110,38 @@ def main():
 
     # ---- 持续监控模式 ----
     if args.monitor:
-        if args.email and not args.smtp_pass:
-            print("[错误] 使用邮件通知需要提供 --smtp-pass (QQ邮箱SMTP授权码)",
-                  file=sys.stderr)
-            print("  获取方法: QQ邮箱 → 设置 → 账户 → POP3/SMTP服务 → 开启 → 生成授权码",
+        if args.email and not args.resend_key:
+            print("[错误] 邮件通知需要 Resend API Key", file=sys.stderr)
+            print("  方式1: --resend-key re_xxxx", file=sys.stderr)
+            print("  方式2: export RESEND_API_KEY=re_xxxx", file=sys.stderr)
+            print("  获取: https://resend.com (免费 100封/天)",
                   file=sys.stderr)
             sys.exit(1)
         monitor_loop(args, hubs)
         sys.exit(0)
 
     # ---- 单次运行模式 ----
+    # 加载去重缓存（CI 模式）
+    dedup_file = args.dedup_file
+    dedup_cache = load_dedup_cache(dedup_file) if dedup_file else {}
+
     hits = run_detection(
         args.key, args.date, hubs,
         verbose=args.verbose, interval=args.interval,
         auto_renew=args.auto_renew,
     )
+
+    # 单次模式也支持邮件通知（CI 用）
+    if hits and args.email and args.resend_key:
+        new_hits = filter_new_hits(hits, dedup_cache) if dedup_file else hits
+        if new_hits:
+            print(f"\n  [通知] 发送 {len(new_hits)} 个新机会到 {args.email}...")
+            ok = send_email(args.email, args.resend_key, new_hits)
+            if ok and dedup_file:
+                dedup_cache = mark_notified(new_hits, dedup_cache)
+                save_dedup_cache(dedup_file, dedup_cache)
+        elif dedup_file:
+            print(f"\n  [去重] 全部 {len(hits)} 个机会已通知过，跳过")
 
     if args.json:
         print(json.dumps(hits, ensure_ascii=False, indent=2))
