@@ -10,6 +10,11 @@ on:
 
   # 支持手动触发（测试用）
   workflow_dispatch:
+    inputs:
+      hub:
+        description: '枢纽机场 (留空=全部)'
+        required: false
+        default: ''
 
 jobs:
   scan:
@@ -43,11 +48,16 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           NOTIFY_EMAIL: '634897859@qq.com'
         run: |
+          HUB_ARG=""
+          if [ -n "${{ github.event.inputs.hub }}" ]; then
+            HUB_ARG="--hub ${{ github.event.inputs.hub }}"
+          fi
           python find_delayed_flights.py \
             --auto-renew \
             --email "$NOTIFY_EMAIL" \
             --dedup-file .notified_cache.json \
             --json \
+            $HUB_ARG \
             2>&1 || true
           # exit 0: 无机会; exit 1: 有机会 (已通过邮件通知)
           # || true: 无论结果如何都继续（保存缓存）
