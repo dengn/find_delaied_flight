@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .notified_cache.json
+.cz_award_cache.json
+cz_award_results.json
+ba_search_*.png
