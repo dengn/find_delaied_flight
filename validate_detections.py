@@ -794,6 +794,388 @@ def run_validation(api_key: str, log_file: str, repo: str = None,
 
 
 # ============================================================
+# 每日回测
+# ============================================================
+
+def run_daily_review(api_key: str, log_file: str,
+                     auto_renew: bool = False, verbose: bool = False,
+                     email: str = None, resend_key: str = None,
+                     repo: str = None,
+                     create_issues: bool = True):
+    """
+    每日回测：回顾前一天所有检测结果，验证预测准确性并发送日报。
+    应在每天早上6点执行 — 此时前一天所有航班都已到达。
+    """
+    log = load_detection_log(log_file)
+    if not log:
+        print("  [日报] 检测日志为空，跳过", file=sys.stderr)
+        return
+
+    now = beijing_now()
+    yesterday = (now - timedelta(days=1)).date()
+    print(f"\n  [日报] 回测日期: {yesterday}", file=sys.stderr)
+
+    # 筛选前一天检测到的记录
+    yesterday_entries = []
+    for entry in log:
+        det_time = parse_time(entry.get("detected_at", ""))
+        if det_time and det_time.date() == yesterday:
+            yesterday_entries.append(entry)
+
+    if not yesterday_entries:
+        print(f"  [日报] {yesterday} 无检测记录，跳过", file=sys.stderr)
+        # 即使无记录也发一封空日报，让用户知道系统在正常运行
+        if email and resend_key:
+            _send_daily_report_email(email, resend_key, yesterday, [], [])
+        return
+
+    print(f"  [日报] {yesterday} 共 {len(yesterday_entries)} 条检测记录",
+          file=sys.stderr)
+
+    api = SimpleAPI(api_key, auto_renew=auto_renew)
+    results = []
+    issues_created = 0
+
+    for entry in yesterday_entries:
+        # 已验证的直接用已有结果
+        if entry.get("validated") and entry.get("validation"):
+            results.append({
+                "entry": entry,
+                "validation": entry["validation"],
+                "accuracy": entry["validation"]["accuracy"],
+            })
+            if verbose:
+                print(f"  [已验证] {entry['flight_no']} {entry['route']} "
+                      f"→ {entry['validation']['accuracy']}",
+                      file=sys.stderr)
+            continue
+
+        # 未验证的现在验证（早上6点，前一天航班都已落地）
+        print(f"  [验证] {entry['flight_no']} {entry['route']} "
+              f"(预测延误{entry['predicted_delay_min']}分)...",
+              file=sys.stderr)
+
+        validation = validate_entry(api, entry)
+        if validation is None:
+            # 到了第二天早上还查不到，标记为数据缺失
+            validation = {
+                "checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "actual_dep_time": "",
+                "actual_arr_time": "",
+                "actual_delay_min": 0,
+                "actual_aircraft": "",
+                "actual_aircraft_type": "",
+                "actual_state": "数据缺失",
+                "aircraft_changed": False,
+                "type_changed": False,
+                "prediction_error_min": 0,
+                "accuracy": "no_data",
+                "root_cause": "航班数据未找到或API未返回结果",
+                "issue_number": None,
+                "issue_url": None,
+            }
+            print(f"    数据缺失，无法验证", file=sys.stderr)
+
+        entry["validated"] = True
+        entry["validation"] = validation
+        results.append({
+            "entry": entry,
+            "validation": validation,
+            "accuracy": validation["accuracy"],
+        })
+
+        acc = validation["accuracy"]
+        if acc in ("good", "fair"):
+            print(f"    准确 — 实际{validation['actual_delay_min']}分",
+                  file=sys.stderr)
+        elif acc == "false_positive":
+            print(f"    误报 — 实际{validation['actual_delay_min']}分",
+                  file=sys.stderr)
+        elif acc == "no_data":
+            pass  # already printed
+        else:
+            print(f"    {acc} — 实际{validation['actual_delay_min']}分",
+                  file=sys.stderr)
+
+        # 对误报/偏高的创建 Issue
+        if (create_issues
+                and acc in ISSUE_ACCURACY_THRESHOLDS):
+            issue_num, issue_url = create_github_issue(
+                entry, validation, repo)
+            if issue_url:
+                validation["issue_number"] = issue_num
+                validation["issue_url"] = issue_url
+                issues_created += 1
+
+    # 保存更新后的日志
+    save_detection_log(log_file, log)
+
+    # 统计
+    total = len(results)
+    valid_results = [r for r in results if r["accuracy"] != "no_data"]
+    good = sum(1 for r in valid_results
+               if r["accuracy"] in ("good", "fair"))
+    bad = sum(1 for r in valid_results
+              if r["accuracy"] == "false_positive")
+    no_data = sum(1 for r in results if r["accuracy"] == "no_data")
+    rate = round(good / len(valid_results) * 100) if valid_results else 0
+
+    print(f"\n  [日报汇总] {yesterday}",
+          file=sys.stderr)
+    print(f"  总检测 {total} | 有数据 {len(valid_results)} "
+          f"| 数据缺失 {no_data}",
+          file=sys.stderr)
+    print(f"  准确 {good} | 误报 {bad} | 准确率 {rate}% "
+          f"| Issue {issues_created}",
+          file=sys.stderr)
+
+    # 发送日报邮件
+    if email and resend_key:
+        _send_daily_report_email(
+            email, resend_key, yesterday, results, yesterday_entries)
+
+
+def _build_daily_report_html(review_date, results: list,
+                              entries: list) -> str:
+    """构建每日回测报告邮件 HTML"""
+    now_str = beijing_now().strftime("%Y-%m-%d %H:%M")
+    date_str = str(review_date)
+    total = len(results)
+
+    valid_results = [r for r in results if r["accuracy"] != "no_data"]
+    good = sum(1 for r in valid_results
+               if r["accuracy"] in ("good", "fair"))
+    bad = sum(1 for r in valid_results
+              if r["accuracy"] == "false_positive")
+    over = sum(1 for r in valid_results
+               if r["accuracy"] == "overpredicted")
+    under = sum(1 for r in valid_results
+                if r["accuracy"] == "underpredicted")
+    cancelled = sum(1 for r in valid_results
+                    if r["accuracy"] == "cancelled")
+    no_data = sum(1 for r in results if r["accuracy"] == "no_data")
+    swapped = sum(1 for r in valid_results
+                  if r.get("validation", {}).get("aircraft_changed"))
+    rate = round(good / len(valid_results) * 100) if valid_results else 0
+
+    # 真正出现航变的（延误>=30分钟 或 取消）
+    real_change = sum(1 for r in valid_results
+                      if r["accuracy"] in ("good", "fair",
+                                            "underpredicted"))
+
+    banner_bg = "#27ae60" if rate >= 70 else (
+        "#e67e22" if rate >= 40 else "#c0392b")
+
+    if total == 0:
+        return f"""
+        <div style="font-family:Arial,sans-serif; max-width:700px; margin:auto;">
+          <div style="background:#34495e; color:white; padding:16px 20px;
+                  border-radius:8px 8px 0 0;">
+            <h2 style="margin:0;">每日回测报告</h2>
+            <p style="margin:6px 0 0; opacity:0.9;">{date_str} | 生成于 {now_str}</p>
+          </div>
+          <div style="padding:30px 20px; text-align:center; color:#666;
+                  background:#f8f9fa; border-radius:0 0 8px 8px;">
+            <p style="font-size:16px;">昨天没有检测到任何航变机会</p>
+            <p style="font-size:13px;">系统运行正常，持续监控中</p>
+          </div>
+        </div>"""
+
+    # 按结果分组：先显示真航变，再误报，最后数据缺失
+    sort_order = {"good": 0, "fair": 1, "underpredicted": 2,
+                  "overpredicted": 3, "cancelled": 4,
+                  "false_positive": 5, "no_data": 6}
+    sorted_results = sorted(results,
+                            key=lambda r: sort_order.get(r["accuracy"], 9))
+
+    rows_html = ""
+    for r in sorted_results:
+        entry = r["entry"]
+        val = r.get("validation", {})
+        acc = r["accuracy"]
+
+        acc_map = {
+            "good": ("#27ae60", "预测准确"),
+            "fair": ("#2ecc71", "基本准确"),
+            "false_positive": ("#c0392b", "误报-未航变"),
+            "overpredicted": ("#e67e22", "预测偏高"),
+            "underpredicted": ("#3498db", "预测偏低"),
+            "cancelled": ("#95a5a6", "航班取消"),
+            "no_data": ("#bdc3c7", "数据缺失"),
+        }
+        acc_color, acc_label = acc_map.get(acc, ("#95a5a6", acc))
+
+        # 实际结果描述
+        actual_delay = val.get("actual_delay_min", 0)
+        actual_state = val.get("actual_state", "")
+        if acc == "no_data":
+            actual_desc = "无数据"
+        elif actual_state in ("取消", "提前取消"):
+            actual_desc = "已取消"
+        elif actual_delay >= 30:
+            actual_desc = f"延误{actual_delay}分钟"
+        elif actual_delay > 0:
+            actual_desc = f"轻微延误{actual_delay}分"
+        else:
+            actual_desc = "正常/准点"
+
+        # 飞机调换标记
+        swap_html = ""
+        if val.get("aircraft_changed"):
+            swap_type = "机型更换" if val.get("type_changed") else "同型调换"
+            swap_html = (f'<br/><span style="background:#9b59b6; '
+                         f'color:white; padding:1px 5px; '
+                         f'border-radius:3px; font-size:10px;">'
+                         f'{swap_type}</span>')
+
+        prob = entry.get("probability", "")
+        prob_str = f"{prob}%" if prob else "-"
+        pred_delay = entry.get("predicted_delay_min", 0)
+        error = val.get("prediction_error_min", 0)
+
+        dep_time = entry.get("plan_departure", "")
+        if dep_time and len(dep_time) >= 16:
+            dep_time = dep_time[11:16]  # HH:MM
+
+        rows_html += f"""
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:8px;">
+            <b>{entry['flight_no']}</b><br/>
+            <span style="color:#666; font-size:12px;">
+              {entry.get('dep_city', entry['route'])}</span><br/>
+            <span style="color:#999; font-size:11px;">
+              计划 {dep_time}</span>
+          </td>
+          <td style="padding:8px; text-align:center;">
+            {prob_str}
+          </td>
+          <td style="padding:8px; text-align:center;">
+            预测{pred_delay}分
+          </td>
+          <td style="padding:8px; text-align:center;">
+            <b>{actual_desc}</b>{swap_html}
+          </td>
+          <td style="padding:8px; text-align:center;">
+            <span style="background:{acc_color}; color:white;
+              padding:3px 8px; border-radius:10px; font-size:12px;">
+              {acc_label}</span>
+          </td>
+          <td style="padding:8px; font-size:12px; color:#666;">
+            {val.get('root_cause', '') if acc != 'no_data' else '-'}
+          </td>
+        </tr>"""
+
+    return f"""
+    <div style="font-family:Arial,sans-serif; max-width:900px; margin:auto;">
+      <div style="background:#2c3e50; color:white; padding:16px 20px;
+              border-radius:8px 8px 0 0;">
+        <h2 style="margin:0;">每日回测报告</h2>
+        <p style="margin:6px 0 0; opacity:0.9;">
+          {date_str} | 生成于 {now_str}</p>
+      </div>
+
+      <div style="background:#f8f9fa; padding:16px 20px; display:flex;
+              gap:16px; flex-wrap:wrap;">
+        <div style="text-align:center; flex:1; min-width:70px;">
+          <div style="font-size:28px; font-weight:bold;">{total}</div>
+          <div style="color:#666; font-size:12px;">检测总数</div>
+        </div>
+        <div style="text-align:center; flex:1; min-width:70px;">
+          <div style="font-size:28px; font-weight:bold; color:#e74c3c;">
+            {real_change}</div>
+          <div style="color:#666; font-size:12px;">真实航变</div>
+        </div>
+        <div style="text-align:center; flex:1; min-width:70px;">
+          <div style="font-size:28px; font-weight:bold; color:#c0392b;">
+            {bad}</div>
+          <div style="color:#666; font-size:12px;">误报</div>
+        </div>
+        <div style="text-align:center; flex:1; min-width:70px;">
+          <div style="font-size:28px; font-weight:bold; color:{banner_bg};">
+            {rate}%</div>
+          <div style="color:#666; font-size:12px;">准确率</div>
+        </div>
+        <div style="text-align:center; flex:1; min-width:70px;">
+          <div style="font-size:28px; font-weight:bold; color:#9b59b6;">
+            {swapped}</div>
+          <div style="color:#666; font-size:12px;">飞机调换</div>
+        </div>
+      </div>
+
+      <table style="width:100%; border-collapse:collapse; margin-top:4px;">
+        <thead>
+          <tr style="background:#34495e; color:white;">
+            <th style="padding:10px; text-align:left;">航班</th>
+            <th style="padding:10px; text-align:center;">概率</th>
+            <th style="padding:10px; text-align:center;">预测</th>
+            <th style="padding:10px; text-align:center;">实际</th>
+            <th style="padding:10px; text-align:center;">结果</th>
+            <th style="padding:10px; text-align:left;">分析</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+
+      <div style="padding:12px 20px; background:#ecf0f1; color:#555;
+              font-size:12px; border-radius:0 0 8px 8px; margin-top:4px;">
+        <b>统计:</b>
+        准确 {good} | 误报 {bad} | 偏高 {over} | 偏低 {under}
+        | 取消 {cancelled} | 数据缺失 {no_data} | 飞机调换 {swapped}
+      </div>
+    </div>"""
+
+
+def _send_daily_report_email(to_addr: str, resend_key: str,
+                              review_date, results: list,
+                              entries: list) -> bool:
+    """发送每日回测报告邮件"""
+    date_str = str(review_date)
+    total = len(results)
+    valid_results = [r for r in results if r.get("accuracy") != "no_data"]
+    good = sum(1 for r in valid_results
+               if r.get("accuracy") in ("good", "fair"))
+    bad = sum(1 for r in valid_results
+              if r.get("accuracy") == "false_positive")
+    rate = round(good / len(valid_results) * 100) if valid_results else 0
+
+    if total == 0:
+        subject = f"[日报] {date_str} 无检测记录"
+    else:
+        subject = (f"[日报] {date_str} "
+                   f"检测{total}条 准确率{rate}% 误报{bad}条")
+
+    html = _build_daily_report_html(review_date, results, entries)
+
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Flight Monitor <onboarding@resend.dev>",
+                "to": [to_addr],
+                "subject": subject,
+                "html": html,
+            },
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            print(f"  [日报邮件] 已发送到 {to_addr}", file=sys.stderr)
+            return True
+        else:
+            print(f"  [日报邮件失败] Resend {resp.status_code}: {resp.text}",
+                  file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"  [日报邮件失败] {e}", file=sys.stderr)
+        return False
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -840,6 +1222,11 @@ def main():
         help="只验证不创建 GitHub Issue",
     )
     parser.add_argument(
+        "--daily-review",
+        action="store_true",
+        help="每日回测模式: 回顾前一天所有检测结果并发送日报",
+    )
+    parser.add_argument(
         "--monitor",
         action="store_true",
         help="持续运行模式，定期验证",
@@ -872,7 +1259,17 @@ def main():
     if not args.resend_key:
         args.resend_key = os.environ.get("RESEND_API_KEY")
 
-    if args.monitor:
+    if args.daily_review:
+        run_daily_review(
+            args.key, args.log,
+            auto_renew=args.auto_renew,
+            verbose=args.verbose,
+            email=args.email,
+            resend_key=args.resend_key,
+            repo=args.repo,
+            create_issues=not args.no_issues,
+        )
+    elif args.monitor:
         print(f"\n  [验证器] 持续验证模式 — "
               f"每 {args.cycle} 分钟检查一次",
               file=sys.stderr)
