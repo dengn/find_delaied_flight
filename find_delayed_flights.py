@@ -31,6 +31,13 @@ import requests
 
 from auto_renew_key import obtain_new_key
 
+try:
+    from validate_detections import append_to_detection_log
+except ImportError:
+    # 验证器不可用时，检测日志功能降级为空操作
+    def append_to_detection_log(filepath, hits):
+        return 0
+
 # ============================================================
 # 配置
 # ============================================================
@@ -67,9 +74,44 @@ CZ_HUBS = {
         "PKX", "CTU", "TFU", "CKG", "WUH", "CSX", "NKG", "XIY",
         "CGO", "DLC", "SHE", "TAO", "HRB",
     ],
+    # ---- 小型机场 —— 运力有限，前序延误传导率高，预测更可靠 ----
+    "KWE": [  # 贵阳 —— 南航运力少，调机难
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG",
+    ],
+    "NNG": [  # 南宁 —— 南航窄体机为主，调机余地小
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK",
+    ],
+    "KHN": [  # 南昌 —— 航班量少，基本无调机可能
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "LHW": [  # 兰州 —— 西北小场，南航运力极少
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC",
+    ],
+    "HET": [  # 呼和浩特 —— 北方小场，调机困难
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX",
+    ],
+    "INC": [  # 银川 —— 西北小场，运力极少
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY",
+    ],
+    "WNZ": [  # 温州 —— 非枢纽，南航航班少
+        "CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "FOC": [  # 福州 —— 非南航基地，运力有限
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG",
+    ],
+    "SYX": [  # 三亚 —— 旅游城市，南航非驻场大量航班
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO",
+    ],
+    "TNA": [  # 济南 —— 航班量少，调机余地小
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "TSN": [  # 天津 —— 非南航基地
+        "CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
 }
 
 # 南航二线基地及常见航线（天气智能扫描时动态启用）
+# 注意：小机场已提升到 CZ_HUBS，这里只保留中型枢纽
 CZ_SECONDARY_HUBS = {
     "WUH": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "XIY", "HAK"],
     "CSX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "NKG", "XIY", "HAK"],
@@ -83,20 +125,31 @@ CZ_SECONDARY_HUBS = {
     "HAK": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO", "NKG"],
     "SHE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
     "TAO": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
-    "NNG": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK"],
-    "KWE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG"],
     "HRB": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "XIY"],
-    "FOC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
-    "SYX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO"],
-    "TNA": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
-    "KHN": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
-    "LHW": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC"],
-    "HET": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX"],
-    "INC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY"],
-    "WNZ": ["CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG"],
     "XMN": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
-    "TSN": ["CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
 }
+
+# 枢纽可靠性分级 —— 大枢纽机队充裕可调机（预测不可靠），小机场运力少（预测可靠）
+# high: 运力极少，前序延误几乎100%传导，很难调机
+# medium: 有一定运力，偶尔可以调机
+# low: 大枢纽，机队充裕，航司调机能力强，前序延误不一定传导
+HUB_RELIABILITY = {
+    # 大枢纽 —— 调机概率高，预测不可靠
+    "CAN": "low", "PKX": "low", "SZX": "low", "PVG": "low",
+    # 中型枢纽 —— 有调机可能但不确定
+    "URC": "medium", "WUH": "medium", "CSX": "medium", "CKG": "medium",
+    "KMG": "medium", "XIY": "medium", "HGH": "medium", "NKG": "medium",
+    "CGO": "medium", "HAK": "medium", "DLC": "medium", "SHE": "medium",
+    "TAO": "medium", "HRB": "medium", "XMN": "medium", "CTU": "medium",
+    "TFU": "medium",
+    # 小机场 —— 运力少，调机几乎不可能，预测可靠
+    "KWE": "high", "NNG": "high", "KHN": "high", "LHW": "high",
+    "HET": "high", "INC": "high", "WNZ": "high", "FOC": "high",
+    "SYX": "high", "TNA": "high", "TSN": "high", "ZUH": "high",
+    "SJW": "high", "XNN": "high", "MDG": "high", "YIH": "high",
+    "JHG": "high", "KRL": "high", "AKU": "high", "BHY": "high",
+}
+
 
 # 易受天气影响的小型/高原/偏远机场（纳入天气预扫描范围）
 WEATHER_SENSITIVE_AIRPORTS = [
@@ -489,6 +542,41 @@ def is_overdue_not_departed(flight: dict, now: datetime) -> bool:
     return True
 
 
+def find_predecessor(inbound_list: list,
+                     outbound_plan_dep: datetime) -> dict | None:
+    """
+    从一组进港航班中找到正确的前序航班。
+
+    关键逻辑：前序航班的计划到达时间必须早于后续航班的计划起飞时间。
+    否则这个进港航班本来就排在后续航班之后（不是前序而是后续）。
+
+    修复场景：
+      飞机 B9933 在 PKX 一天内执行多段航班：
+        CZ3128 PKX→CSX 计划起飞 15:55
+        CZ8866 CSX→PKX 计划到达 00:05 (次日)
+      CZ8866 不是 CZ3128 的前序（它在 CZ3128 之后），不应匹配。
+
+    匹配规则：
+      1. 前序的计划到达 必须早于 后续的计划起飞（时间先后校验）
+      2. 取计划到达最晚的候选（即直接前序）
+    """
+    candidates = []
+    for fl in inbound_list:
+        plan_arr = parse_time(fl.get("FlightArrtimePlanDate", ""))
+        if not plan_arr:
+            continue
+        # 核心校验：前序的计划到达 必须早于 后续的计划起飞
+        if plan_arr < outbound_plan_dep:
+            candidates.append((fl, plan_arr))
+
+    if not candidates:
+        return None
+
+    # 取计划到达最晚的一个（直接前序）
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
+
+
 # ============================================================
 # 机场态势分析（辅助信息）
 # ============================================================
@@ -533,6 +621,112 @@ def analyze_airport_situation(all_flights: list) -> dict:
         "delay_rate": round(delay_rate, 3),
         "avg_delay_min": round(avg_delay),
     }
+
+
+# ============================================================
+# 概率评估：综合评估航变机会的可靠性
+# ============================================================
+
+def calculate_probability(hit: dict) -> int:
+    """
+    综合评估航变机会实际发生的概率 (0-99%)。
+
+    因素权重：
+      1. 枢纽调机能力 (±20%)  — 大枢纽容易换飞机，小机场几乎不可能
+      2. 前序航班状态 (基准)   — 未起飞 > 在飞 > 已到达
+      3. 延误幅度 (+0~15%)    — 延误越多，过站越来不及，概率越高
+      4. 前序超时未起飞 (+10%) — 铁定来不及
+      5. 距出发时间 (±5%)     — 越近越来不及调机
+      6. 机场延误态势 (+0~5%) — 整体延误率高时调机更难
+    """
+    prob = 0
+
+    # ---- 因素1: 前序航班状态 (基准分) ----
+    inbound_state = hit.get("inbound_state", "")
+    if hit.get("is_priority"):
+        # 前序超时未起飞 — 基础就极高
+        prob = 88
+    elif inbound_state in ("计划", "延误"):
+        # 前序尚未起飞
+        prob = 82
+    elif inbound_state == "起飞":
+        # 前序在飞，预计到达已确定
+        prob = 75
+    else:
+        # 前序已到达，过站时间不足
+        prob = 70
+
+    # ---- 因素2: 枢纽调机能力 ----
+    reliability = hit.get("hub_reliability", "medium")
+    if reliability == "high":
+        prob += 8    # 小机场，调机概率极低
+    elif reliability == "low":
+        prob -= 18   # 大枢纽，调机概率高
+    else:
+        prob -= 5    # 中型枢纽
+
+    # ---- 因素3: 延误幅度 ----
+    delay = hit.get("estimated_delay_min", 0)
+    if delay >= 180:
+        prob += 10   # 3小时+，几乎不可能正常
+    elif delay >= 120:
+        prob += 7
+    elif delay >= 60:
+        prob += 4
+    elif delay >= 30:
+        prob += 1
+
+    # ---- 因素4: 前序超时未起飞加成 ----
+    overdue_min = hit.get("inbound_overdue_min", 0)
+    if overdue_min >= 60:
+        prob += 5    # 超时1小时+
+    elif overdue_min >= 30:
+        prob += 3
+
+    # ---- 因素5: 距出发时间 ----
+    mins_left = hit.get("minutes_until_departure", 999)
+    if mins_left < 120:
+        prob += 5    # 不到2小时，调机时间都不够
+    elif mins_left < 240:
+        prob += 2
+    elif mins_left > 480:
+        prob -= 3    # 8小时+，有充裕时间调度
+
+    # ---- 因素6: 机场整体延误态势 ----
+    sit = hit.get("airport_situation", {})
+    delay_rate = sit.get("delay_rate", 0)
+    if delay_rate >= 0.4:
+        prob += 5    # 整体延误率高，调机资源更紧张
+    elif delay_rate >= 0.2:
+        prob += 2
+
+    return max(15, min(99, prob))
+
+
+def probability_label(prob: int) -> str:
+    """概率 → 中文标签"""
+    if prob >= 90:
+        return "极高"
+    elif prob >= 75:
+        return "高"
+    elif prob >= 60:
+        return "中等"
+    elif prob >= 45:
+        return "偏低"
+    else:
+        return "低"
+
+
+def probability_color(prob: int) -> str:
+    """概率 → 颜色 (用于邮件HTML)"""
+    if prob >= 85:
+        return "#c0392b"  # 深红
+    elif prob >= 70:
+        return "#e74c3c"  # 红
+    elif prob >= 55:
+        return "#e67e22"  # 橙
+    else:
+        return "#95a5a6"  # 灰
 
 
 # ============================================================
@@ -758,9 +952,9 @@ def run_detection(api_key: str, date: str, hubs: dict,
 
         print(f"    进港航班共 {len(inbound_flights)} 个")
 
-        # 找出严重延误的进港航班，建立 机号→航班 映射
-        # 只保留每架飞机最晚的那个进港航班（即直接前序）
-        aircraft_inbound = {}
+        # 找出严重延误的进港航班，建立 机号→航班列表 映射
+        # 每架飞机保存所有进港航班，后续 Step 3 再根据时间顺序找正确前序
+        aircraft_inbound = {}  # {机号: [航班列表]}
         delayed_aircraft = set()
         for fl in inbound_flights:
             ac = fl.get("AircraftNumber", "").strip()
@@ -771,20 +965,18 @@ def run_detection(api_key: str, date: str, hubs: dict,
             if not est_arr:
                 continue
 
-            # 保留该机号最晚到达的进港航班
-            if ac in aircraft_inbound:
-                prev_arr = get_best_arrival_time(aircraft_inbound[ac])
-                if prev_arr and est_arr <= prev_arr:
-                    continue
-            aircraft_inbound[ac] = fl
+            # 保存该机号所有进港航班（不再只保留最晚的）
+            if ac not in aircraft_inbound:
+                aircraft_inbound[ac] = []
+            aircraft_inbound[ac].append(fl)
 
-            # 标记延误飞机
+            # 标记延误飞机（用于 Step 3 快速过滤，宁多勿漏）
             if plan_arr:
                 delay = (est_arr - plan_arr).total_seconds() / 60
                 if delay >= SIGNIFICANT_DELAY_MINUTES:
                     delayed_aircraft.add(ac)
 
-            # 新增: 前序已过计划起飞时间但尚未起飞
+            # 前序已过计划起飞时间但尚未起飞
             if is_overdue_not_departed(fl, now):
                 delayed_aircraft.add(ac)
 
@@ -795,7 +987,9 @@ def run_detection(api_key: str, date: str, hubs: dict,
         if delayed_aircraft:
             print(f"  [发现] {len(delayed_aircraft)} 架飞机前序严重延误:")
             for ac in delayed_aircraft:
-                fl = aircraft_inbound[ac]
+                # 取延误最严重的进港航班用于展示
+                fl = max(aircraft_inbound[ac],
+                         key=lambda f: get_best_arrival_time(f) or datetime.min)
                 est_arr = get_best_arrival_time(fl)
                 plan_arr = parse_time(fl.get("FlightArrtimePlanDate", ""))
                 delay = round((est_arr - plan_arr).total_seconds() / 60) if (est_arr and plan_arr) else 0
@@ -860,10 +1054,19 @@ def run_detection(api_key: str, date: str, hubs: dict,
             if ac not in delayed_aircraft:
                 continue
 
-            # 前序航班到达的机场 == 后续航班出发的机场
-            inbound = aircraft_inbound.get(ac)
+            inbound_list = aircraft_inbound.get(ac, [])
+            if not inbound_list:
+                continue
+
+            # 找到正确的前序航班（计划到达必须在后续计划起飞之前）
+            outbound_plan_dep = parse_time(fl.get("FlightDeptimePlanDate", ""))
+            if not outbound_plan_dep:
+                continue
+            inbound = find_predecessor(inbound_list, outbound_plan_dep)
             if not inbound:
                 continue
+
+            # 前序航班到达的机场 == 后续航班出发的机场
             if inbound.get("FlightArrcode") != fl.get("FlightDepcode"):
                 continue
 
@@ -871,8 +1074,10 @@ def run_detection(api_key: str, date: str, hubs: dict,
             hit = analyze_inbound_chain(fl, inbound, now)
             if hit:
                 hit["hub"] = hub
+                hit["hub_reliability"] = HUB_RELIABILITY.get(hub, "medium")
                 hit["airport_situation"] = airport_sit
                 hit["hub_weather"] = weather_text
+                hit["probability"] = calculate_probability(hit)
                 all_hits.append(hit)
 
         if verbose:
@@ -891,7 +1096,8 @@ def run_detection(api_key: str, date: str, hubs: dict,
         }
         # 保存延误飞机详情（只保留南航集团航班）
         for ac in delayed_aircraft:
-            fl = aircraft_inbound[ac]
+            fl = max(aircraft_inbound[ac],
+                     key=lambda f: get_best_arrival_time(f) or datetime.min)
             fno = fl.get("FlightNo", "")
             if not is_cz_group_flight(fno):
                 continue
@@ -931,8 +1137,8 @@ def run_detection(api_key: str, date: str, hubs: dict,
               f"{api.error_count} 次失败)")
         return all_hits, summary
 
-    # 排序：优先级(前序超时未起飞)在前，然后按预估延误时间降序
-    all_hits.sort(key=lambda h: (h.get("is_priority", False),
+    # 排序：概率从高到低（概率已综合了可靠性、前序状态、延误幅度等）
+    all_hits.sort(key=lambda h: (h.get("probability", 50),
                                  h["estimated_delay_min"]),
                   reverse=True)
 
@@ -949,9 +1155,12 @@ def run_detection(api_key: str, date: str, hubs: dict,
         mins_remain = mins_left % 60
         is_priority = hit.get("is_priority", False)
 
+        prob = hit.get("probability", 50)
+        prob_label = probability_label(prob)
         priority_tag = " ⚠️ 重点关注" if is_priority else ""
         print(f"  ┌─[{i}] {hit['flight']}  "
-              f"{hit['route']}  ({hit['dep_city']}){priority_tag}")
+              f"{hit['route']}  ({hit['dep_city']})"
+              f"  【{prob}% {prob_label}】{priority_tag}")
         if is_priority:
             print(f"  │ *** 前序航班已超计划起飞时间"
                   f"{hit.get('inbound_overdue_min', 0)}分钟仍未起飞! ***")
@@ -1049,6 +1258,16 @@ def build_email_html(hits: list) -> str:
                 'font-size:12px; font-weight:bold;">'
                 f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
 
+        # 概率标签
+        prob = hit.get("probability", 50)
+        p_color = probability_color(prob)
+        p_label = probability_label(prob)
+        probability_badge = (
+            f'<span style="display:inline-block; padding:3px 12px; '
+            f'background:{p_color}; color:white; border-radius:12px; '
+            f'font-size:14px; font-weight:bold; margin-left:8px;">'
+            f'{prob}% {p_label}</span>')
+
         header_bg = "#ffe0e0" if is_priority else "#fff3f3"
 
         # 后续航班：航司调整时间行
@@ -1082,6 +1301,7 @@ def build_email_html(hits: list) -> str:
           <td colspan="2" style="padding:12px; background:{header_bg};">
             <h3 style="margin:0; color:#c0392b;">
               [{i}] {hit['flight']}  {hit['route']}  ({hit['dep_city']})
+              {probability_badge}
             </h3>
             {priority_badge}
           </td>
@@ -1182,16 +1402,21 @@ def build_email_html(hits: list) -> str:
 
 def send_email(to_addr: str, resend_key: str, hits: list) -> bool:
     """通过 Resend API 发送航变提醒邮件（免授权码）"""
-    subject = (f"[航变提醒] 发现 {len(hits)} 个机会! "
-               f"{hits[0]['flight']} 预延{hits[0]['estimated_delay_min']}分钟")
+    top = hits[0]
+    top_prob = top.get('probability', 50)
+    subject = (f"[航变提醒] {len(hits)}个机会 "
+               f"最高{top_prob}% | "
+               f"{top['flight']} 延{top['estimated_delay_min']}分")
     html = build_email_html(hits)
 
     # 纯文本备用
     text_lines = []
     for i, hit in enumerate(hits, 1):
         priority_tag = "[重点] " if hit.get("is_priority") else ""
+        hit_prob = hit.get("probability", 50)
         text_lines.append(
             f"{priority_tag}[{i}] {hit['flight']} {hit['route']} "
+            f"概率{hit_prob}% "
             f"预估延误{hit['estimated_delay_min']}分钟 "
             f"状态:{hit['current_state']}")
         text_lines.append(
@@ -1320,6 +1545,16 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                     'font-size:11px; font-weight:bold;">'
                     f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
 
+            # 概率标签
+            prob = hit.get("probability", 50)
+            p_color = probability_color(prob)
+            p_label = probability_label(prob)
+            prob_html = (
+                f'<span style="display:inline-block; padding:2px 8px; '
+                f'background:{p_color}; color:white; border-radius:10px; '
+                f'font-size:12px; font-weight:bold; margin-left:6px;">'
+                f'{prob}% {p_label}</span>')
+
             border_color = "#c0392b" if is_priority else "#e74c3c"
             row_bg = "#ffe5e5" if is_priority else "#fff5f5"
 
@@ -1349,6 +1584,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                 <div style="font-weight:bold; color:#c0392b; font-size:15px;">
                   [{i}] {hit['flight']} &nbsp; {hit['route']}
                   &nbsp; ({hit['dep_city']})
+                  {prob_html}
                 </div>
                 {priority_html}
                 <div style="margin-top:6px; font-size:13px;">
@@ -1497,8 +1733,9 @@ def send_summary_email(to_addr: str, resend_key: str,
     hub_names = ", ".join(summary.get("hubs", {}).keys())
 
     if n_hits > 0:
-        subject = (f"[航变报告] {date} 发现 {n_hits} 个机会! "
-                   f"({hub_names})")
+        top_prob = max(h.get("probability", 50) for h in hits)
+        subject = (f"[航变报告] {date} {n_hits}个机会 "
+                   f"最高{top_prob}% ({hub_names})")
     else:
         subject = f"[航变报告] {date} {run_time} 未发现机会 ({hub_names})"
 
@@ -1523,8 +1760,10 @@ def send_summary_email(to_addr: str, resend_key: str,
         text_lines.append(f"发现 {n_hits} 个航变机会:")
         for i, h in enumerate(hits, 1):
             priority_tag = "[重点] " if h.get("is_priority") else ""
+            h_prob = h.get("probability", 50)
             text_lines.append(
                 f"  {priority_tag}[{i}] {h['flight']} {h['route']} "
+                f"{h_prob}% "
                 f"预延{h['estimated_delay_min']}分 "
                 f"状态:{h['current_state']}")
             text_lines.append(
@@ -1619,6 +1858,431 @@ def mark_notified(hits: list, cache: dict) -> dict:
 
 
 # ============================================================
+# 飞机调换跟踪系统
+# ============================================================
+#
+# 在广州等大枢纽，航司可以调配飞机：
+#   - 机型变更（A321→A330, 波音→空客等）→ 有效航变，可免费改退
+#   - 同机型调换（A321→A321 但不同机号）→ 延误可能不发生
+# 所以检测到机会后需要持续跟踪飞机变化。
+
+TRACKING_EXPIRE_HOURS = 12  # 跟踪记录超过12小时自动过期
+
+
+def make_tracking_key(hit: dict) -> str:
+    """生成跟踪唯一标识"""
+    return f"{hit['flight']}|{hit['plan_departure']}"
+
+
+def load_tracking_cache(filepath: str) -> dict:
+    """加载跟踪缓存"""
+    if not filepath:
+        return {}
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+        now = beijing_now()
+        cleaned = {}
+        for k, v in data.items():
+            try:
+                dt = datetime.fromisoformat(v.get("detected_at", ""))
+            except (ValueError, TypeError):
+                continue
+            age_hours = (now - dt).total_seconds() / 3600
+            if age_hours < TRACKING_EXPIRE_HOURS and v.get("status") == "tracking":
+                cleaned[k] = v
+        return cleaned
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def save_tracking_cache(filepath: str, cache: dict):
+    """保存跟踪缓存"""
+    if not filepath:
+        return
+    with open(filepath, "w") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def add_hits_to_tracking(hits: list, tracking: dict, now: datetime) -> int:
+    """将新检测到的机会加入跟踪，返回新增数量"""
+    added = 0
+    for hit in hits:
+        key = make_tracking_key(hit)
+        if key in tracking:
+            continue
+        tracking[key] = {
+            "flight_no": hit["flight"],
+            "route": hit["route"],
+            "dep_city": hit.get("dep_city", ""),
+            "dep_code": (hit["route"].split(" → ")[0].strip()
+                         if " → " in hit["route"] else ""),
+            "arr_code": (hit["route"].split(" → ")[1].strip()
+                         if " → " in hit["route"] else ""),
+            "plan_departure": hit["plan_departure"],
+            "original_aircraft": hit["aircraft"],
+            "original_aircraft_type": hit.get("aircraft_type", ""),
+            "original_delay_min": hit["estimated_delay_min"],
+            "hub": hit.get("hub", ""),
+            "detected_at": now.isoformat(),
+            "last_checked_at": now.isoformat(),
+            "status": "tracking",
+            "notified_changes": [],
+        }
+        added += 1
+    return added
+
+
+def check_tracked_flights(api, tracking: dict,
+                          verbose: bool = False) -> tuple[list, int]:
+    """
+    重新查询被跟踪的航班，检测飞机调换和状态变更。
+    返回 (changes, api_calls)。
+    """
+    now = beijing_now()
+    changes = []
+    api_calls = 0
+
+    for key, info in list(tracking.items()):
+        if info["status"] != "tracking":
+            continue
+
+        plan_dep = parse_time(info["plan_departure"])
+        if not plan_dep:
+            continue
+
+        # 已过起飞时间 → 停止跟踪
+        if plan_dep < now:
+            info["status"] = "expired"
+            continue
+
+        # 距起飞不足30分钟 → 停止跟踪
+        minutes_left = (plan_dep - now).total_seconds() / 60
+        if minutes_left < 30:
+            info["status"] = "expired"
+            continue
+
+        dep = info["dep_code"]
+        arr = info["arr_code"]
+        date = info["plan_departure"][:10]
+        if not dep or not arr:
+            continue
+
+        # 重新查询航班
+        flights = api.search_flights(dep, arr, date)
+        api_calls += 1
+
+        # 找到目标航班
+        target = None
+        for fl in flights:
+            if fl.get("FlightNo") == info["flight_no"]:
+                target = fl
+                break
+
+        if not target:
+            if verbose:
+                print(f"    [跟踪] {info['flight_no']} 未在查询结果中找到",
+                      file=sys.stderr)
+            continue
+
+        info["last_checked_at"] = now.isoformat()
+
+        current_aircraft = target.get("AircraftNumber", "").strip()
+        current_type = target.get("ftype", "")
+        current_state = target.get("FlightState", "")
+        actual_dep = parse_time(target.get("FlightDeptimeDate", ""))
+
+        # —— 已实际起飞 → 停止跟踪 ——
+        if actual_dep or current_state in ("起飞", "到达"):
+            info["status"] = "departed"
+            change_id = "departed"
+            notified_ids = [c.get("id") for c in info["notified_changes"]]
+            if change_id not in notified_ids:
+                changes.append({
+                    "type": "departed",
+                    "id": change_id,
+                    "flight_no": info["flight_no"],
+                    "route": info["route"],
+                    "dep_city": info.get("dep_city", ""),
+                    "message": "航班已起飞，停止跟踪",
+                    "current_aircraft": current_aircraft,
+                    "current_type": current_type,
+                    "original_aircraft": info["original_aircraft"],
+                    "original_type": info["original_aircraft_type"],
+                })
+                info["notified_changes"].append(
+                    {"id": change_id, "time": now.isoformat()})
+            continue
+
+        # —— 航司发布航变（状态变为延误/取消）——
+        if current_state in ("延误", "取消", "提前取消"):
+            change_id = f"state_{current_state}"
+            notified_ids = [c.get("id") for c in info["notified_changes"]]
+            if change_id not in notified_ids:
+                changes.append({
+                    "type": "state_change",
+                    "id": change_id,
+                    "flight_no": info["flight_no"],
+                    "route": info["route"],
+                    "dep_city": info.get("dep_city", ""),
+                    "message": f"航司已发布航变，状态: {current_state}",
+                    "current_aircraft": current_aircraft,
+                    "current_type": current_type,
+                    "original_aircraft": info["original_aircraft"],
+                    "original_type": info["original_aircraft_type"],
+                })
+                info["notified_changes"].append(
+                    {"id": change_id, "time": now.isoformat()})
+                info["status"] = "resolved"
+            continue
+
+        # —— 飞机调换检测 ——
+        if current_aircraft and current_aircraft != info["original_aircraft"]:
+            change_id = f"swap_{current_aircraft}"
+            notified_ids = [c.get("id") for c in info["notified_changes"]]
+            if change_id not in notified_ids:
+                orig_type = info["original_aircraft_type"]
+                # 判断机型是否变更
+                type_changed = False
+                if current_type and orig_type:
+                    type_changed = current_type != orig_type
+
+                if type_changed:
+                    # 机型变了 → 有效航变（可免费改退）
+                    message = (
+                        f"机型更换! "
+                        f"{info['original_aircraft']} ({orig_type}) → "
+                        f"{current_aircraft} ({current_type})  "
+                        f"可视为有效航变（可免费改退）")
+                    ctype = "type_change"
+                else:
+                    # 同机型调换 → 延误可能不发生
+                    message = (
+                        f"同机型调换: "
+                        f"{info['original_aircraft']} ({orig_type}) → "
+                        f"{current_aircraft} ({current_type or orig_type})  "
+                        f"前序延误可能已通过调机解决，延误不一定发生")
+                    ctype = "same_type_swap"
+
+                changes.append({
+                    "type": ctype,
+                    "id": change_id,
+                    "flight_no": info["flight_no"],
+                    "route": info["route"],
+                    "dep_city": info.get("dep_city", ""),
+                    "message": message,
+                    "original_aircraft": info["original_aircraft"],
+                    "original_type": orig_type,
+                    "current_aircraft": current_aircraft,
+                    "current_type": current_type,
+                    "type_changed": type_changed,
+                    "minutes_until_dep": round(minutes_left),
+                })
+                info["notified_changes"].append(
+                    {"id": change_id, "time": now.isoformat()})
+                # 更新跟踪信息为新飞机（后续跟踪新飞机的变化）
+                info["original_aircraft"] = current_aircraft
+                info["original_aircraft_type"] = current_type or orig_type
+
+        if verbose:
+            print(f"    [跟踪] {info['flight_no']}: "
+                  f"机号 {current_aircraft} ({current_type}) "
+                  f"状态 {current_state} "
+                  f"距起飞 {round(minutes_left)}分",
+                  file=sys.stderr)
+
+    return changes, api_calls
+
+
+def build_tracking_email_html(changes: list) -> str:
+    """构建跟踪变更通知邮件 HTML"""
+    rows = []
+    for c in changes:
+        ctype = c["type"]
+        if ctype == "type_change":
+            color = "#c0392b"
+            badge_bg = "#c0392b"
+            badge_text = "机型更换 — 有效航变"
+        elif ctype == "same_type_swap":
+            color = "#e67e22"
+            badge_bg = "#e67e22"
+            badge_text = "同型调换 — 延误可能不发生"
+        elif ctype == "state_change":
+            color = "#2980b9"
+            badge_bg = "#2980b9"
+            badge_text = "航司已发布航变"
+        elif ctype == "departed":
+            color = "#27ae60"
+            badge_bg = "#27ae60"
+            badge_text = "已起飞"
+        else:
+            color = "#666"
+            badge_bg = "#666"
+            badge_text = ctype
+
+        mins = c.get("minutes_until_dep", 0)
+        time_info = ""
+        if mins > 0:
+            time_info = f" (距起飞 {mins // 60}时{mins % 60}分)"
+
+        rows.append(f"""
+        <tr style="border-left:4px solid {color}; background:#fafafa;">
+          <td style="padding:12px;" colspan="2">
+            <div style="margin-bottom:6px;">
+              <span style="display:inline-block; padding:3px 10px;
+                    background:{badge_bg}; color:white; border-radius:3px;
+                    font-size:12px; font-weight:bold;">
+                {badge_text}</span>
+            </div>
+            <div style="font-weight:bold; font-size:15px; color:#2c3e50;">
+              {c['flight_no']} &nbsp; {c['route']}
+              &nbsp; ({c.get('dep_city', '')}){time_info}
+            </div>
+            <div style="margin-top:8px; font-size:13px; line-height:1.6;">
+              {c['message']}
+            </div>
+            <div style="margin-top:6px; font-size:12px; color:#888;">
+              原始机号: {c.get('original_aircraft', '')}
+              ({c.get('original_type', '')})
+              &nbsp;&rarr;&nbsp;
+              当前机号: {c.get('current_aircraft', '')}
+              ({c.get('current_type', '')})
+            </div>
+          </td>
+        </tr>
+        <tr><td colspan="2" style="padding:2px;"></td></tr>
+        """)
+
+    now_str = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    html = f"""
+    <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;
+                       background:#f5f5f5; padding:20px;">
+    <div style="max-width:700px; margin:0 auto; background:white;
+                border-radius:8px; overflow:hidden;
+                box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+      <div style="background:#8e44ad; color:white; padding:16px;
+                  text-align:center;">
+        <h2 style="margin:0;">航班跟踪变更通知</h2>
+        <p style="margin:4px 0 0; font-size:13px;">检测时间: {now_str}</p>
+      </div>
+      <div style="padding:12px; text-align:center; background:#f3e5f5;">
+        <span style="font-size:18px; font-weight:bold; color:#8e44ad;">
+          检测到 {len(changes)} 个跟踪变更
+        </span>
+      </div>
+      <div style="padding:16px;">
+        <table style="width:100%; border-collapse:collapse; font-size:14px;">
+          {''.join(rows)}
+        </table>
+      </div>
+      <div style="padding:10px 16px; background:#f9f9f9; color:#999;
+                  font-size:12px; text-align:center;">
+        南航航变检测器 — 飞机调换跟踪
+      </div>
+    </div>
+    </body></html>
+    """
+    return html
+
+
+def send_tracking_email(to_addr: str, resend_key: str,
+                        changes: list) -> bool:
+    """发送跟踪变更通知邮件"""
+    if not changes:
+        return False
+
+    type_changes = [c for c in changes if c["type"] == "type_change"]
+    swaps = [c for c in changes if c["type"] == "same_type_swap"]
+    state_changes = [c for c in changes if c["type"] == "state_change"]
+
+    summary_parts = []
+    if type_changes:
+        summary_parts.append(f"{len(type_changes)}个机型更换")
+    if swaps:
+        summary_parts.append(f"{len(swaps)}个同型调换")
+    if state_changes:
+        summary_parts.append(f"{len(state_changes)}个航变通知")
+
+    first = changes[0]
+    subject = (f"[航班跟踪] {first['flight_no']} "
+               f"{', '.join(summary_parts) or first['message'][:30]}")
+
+    html = build_tracking_email_html(changes)
+
+    text_lines = ["航班跟踪变更通知", ""]
+    for c in changes:
+        text_lines.append(f"  [{c['type']}] {c['flight_no']} {c['route']}")
+        text_lines.append(f"  {c['message']}")
+        text_lines.append("")
+
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Flight Alert <onboarding@resend.dev>",
+                "to": [to_addr],
+                "subject": subject,
+                "html": html,
+                "text": "\n".join(text_lines),
+            },
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            print(f"  [跟踪邮件] 已发送到 {to_addr}", file=sys.stderr)
+            return True
+        else:
+            print(f"  [跟踪邮件失败] Resend 返回 {resp.status_code}",
+                  file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"  [跟踪邮件失败] {e}", file=sys.stderr)
+        return False
+
+
+def run_tracking_check(api_key: str, tracking: dict, track_file: str,
+                       email: str = None, resend_key: str = None,
+                       verbose: bool = False,
+                       interval: float = REQUEST_INTERVAL,
+                       auto_renew: bool = False) -> list:
+    """执行一次跟踪检查，返回变更列表"""
+    if not tracking:
+        return []
+    active = sum(1 for v in tracking.values() if v["status"] == "tracking")
+    if active == 0:
+        return []
+
+    now = beijing_now()
+    print(f"  [{now.strftime('%H:%M:%S')}] [跟踪] "
+          f"检查 {active} 个航班...", file=sys.stderr)
+
+    track_api = VariFlightAPI(api_key, interval=interval,
+                              auto_renew=auto_renew)
+    changes, api_calls = check_tracked_flights(
+        track_api, tracking, verbose=verbose)
+
+    if changes:
+        # 过滤不需要通知的类型（已起飞是正常结束，不发邮件）
+        notify_changes = [c for c in changes if c["type"] != "departed"]
+        if notify_changes and email and resend_key:
+            send_tracking_email(email, resend_key, notify_changes)
+        for c in changes:
+            icon = {"type_change": "✈️", "same_type_swap": "🔄",
+                    "state_change": "⚠️", "departed": "✅"}.get(
+                c["type"], "ℹ️")
+            print(f"    {icon} {c['flight_no']}: {c['message']}",
+                  file=sys.stderr)
+
+    if track_file:
+        save_tracking_cache(track_file, tracking)
+
+    return changes
+
+
+# ============================================================
 # 持续监控
 # ============================================================
 
@@ -1635,6 +2299,11 @@ def monitor_loop(args, hubs: dict):
         notified = load_dedup_cache(dedup_file)
     else:
         notified = {}
+
+    # 跟踪缓存
+    track_file = getattr(args, 'track_file', None)
+    tracking = load_tracking_cache(track_file) if track_file else {}
+    track_interval = getattr(args, 'track_interval', 5)
 
     stop_flag = [False]
 
@@ -1654,6 +2323,8 @@ def monitor_loop(args, hubs: dict):
     print(f"  通知邮箱: {args.email}")
     print(f"  活跃时段: {args.active_start}:00 - {args.active_end}:00")
     print(f"  通知方式: Resend API")
+    if track_file:
+        print(f"  飞机跟踪: 每 {track_interval} 分钟检查一次")
     print(f"  按 Ctrl+C 安全退出")
     print(f"{'='*70}\n")
 
@@ -1734,22 +2405,64 @@ def monitor_loop(args, hubs: dict):
         if dedup_file:
             save_dedup_cache(dedup_file, notified)
 
+        # 追加检测结果到日志（供验证器分析准确性）
+        detection_log = getattr(args, 'detection_log', None)
+        if hits and detection_log:
+            dl_added = append_to_detection_log(detection_log, hits)
+            if dl_added > 0:
+                print(f"  [检测日志] 追加 {dl_added} 条记录到 {detection_log}",
+                      file=sys.stderr)
+
+        # 将命中结果加入跟踪
+        if hits and track_file:
+            now_track = beijing_now()
+            added = add_hits_to_tracking(hits, tracking, now_track)
+            if added > 0:
+                print(f"  [跟踪] 新增 {added} 个航班到跟踪列表 "
+                      f"(共 {len(tracking)} 个)", file=sys.stderr)
+
+        # 跟踪检查（检测完毕后立即执行一次）
+        if tracking and track_file:
+            run_tracking_check(
+                args.key, tracking, track_file,
+                email=args.email, resend_key=resend_key,
+                verbose=args.verbose, interval=args.interval,
+                auto_renew=args.auto_renew)
+
         print(f"  [统计] 已运行 {cycle_count} 轮, "
               f"累计发现 {total_hits_found} 个新机会, "
-              f"去重池 {len(notified)} 条")
+              f"去重池 {len(notified)} 条"
+              f"{f', 跟踪 {len(tracking)} 个' if tracking else ''}")
 
         if stop_flag[0]:
             break
 
-        print(f"  [休眠] {cycle_min} 分钟后进行下一轮检测...")
-        wait_sec = cycle_min * 60
-        while wait_sec > 0 and not stop_flag[0]:
-            time.sleep(min(wait_sec, 10))
-            wait_sec -= 10
+        # 休眠期间穿插高频跟踪检查
+        print(f"  [休眠] {cycle_min} 分钟后进行下一轮检测"
+              f"{f' (期间每 {track_interval} 分跟踪一次)' if tracking else ''}...")
+        remaining_sec = cycle_min * 60
+        track_timer = track_interval * 60
+        while remaining_sec > 0 and not stop_flag[0]:
+            sleep_chunk = min(remaining_sec, 10)
+            time.sleep(sleep_chunk)
+            remaining_sec -= sleep_chunk
+            track_timer -= sleep_chunk
+
+            # 到达跟踪检查间隔 → 执行跟踪
+            if track_timer <= 0 and tracking and track_file:
+                track_timer = track_interval * 60
+                if not stop_flag[0]:
+                    run_tracking_check(
+                        args.key, tracking, track_file,
+                        email=args.email, resend_key=resend_key,
+                        verbose=args.verbose, interval=args.interval,
+                        auto_renew=args.auto_renew)
 
     # 退出前保存
     if dedup_file:
         save_dedup_cache(dedup_file, notified)
+    if track_file:
+        save_tracking_cache(track_file, tracking)
 
     print(f"\n  [监控结束] 共运行 {cycle_count} 轮, "
           f"发现 {total_hits_found} 个新机会")
@@ -1868,6 +2581,16 @@ def main():
         default=None,
         help="去重缓存文件路径 (CI模式用，跨运行持久化去重记录)",
     )
+    notify_group.add_argument(
+        "--track-file",
+        default=None,
+        help="飞机调换跟踪缓存文件 (跟踪已发现机会的后续飞机变动)",
+    )
+    notify_group.add_argument(
+        "--detection-log",
+        default=None,
+        help="检测日志文件 (供验证器追踪预测准确性, 例: .detection_log.json)",
+    )
 
     # ---- 持续监控相关 ----
     monitor_group = parser.add_argument_group("持续监控模式")
@@ -1893,6 +2616,12 @@ def main():
         type=int,
         default=23,
         help="活跃监控结束时间(整点, 0-23)，默认 23",
+    )
+    monitor_group.add_argument(
+        "--track-interval",
+        type=int,
+        default=5,
+        help="跟踪检查间隔(分钟)，默认 5 (持续监控模式下，在检测周期间穿插跟踪检查)",
     )
 
     args = parser.parse_args()
@@ -1944,6 +2673,17 @@ def main():
     dedup_file = args.dedup_file
     dedup_cache = load_dedup_cache(dedup_file) if dedup_file else {}
 
+    # 加载跟踪缓存 & 检查已跟踪航班（在检测前执行，获取最新变更）
+    track_file = args.track_file
+    tracking = load_tracking_cache(track_file) if track_file else {}
+    if tracking:
+        print(f"\n  [跟踪] 检查 {len(tracking)} 个已跟踪航班的飞机变动...")
+        run_tracking_check(
+            args.key, tracking, track_file,
+            email=args.email, resend_key=args.resend_key,
+            verbose=args.verbose, interval=args.interval,
+            auto_renew=args.auto_renew)
+
     hits, summary = run_detection(
         args.key, args.date, hubs,
         verbose=args.verbose, interval=args.interval,
@@ -1965,6 +2705,23 @@ def main():
             if new_hits:
                 dedup_cache = mark_notified(new_hits, dedup_cache)
                 save_dedup_cache(dedup_file, dedup_cache)
+
+    # 将命中结果加入跟踪
+    if hits and track_file:
+        now = beijing_now()
+        added = add_hits_to_tracking(hits, tracking, now)
+        if added > 0:
+            print(f"  [跟踪] 新增 {added} 个航班到跟踪列表 "
+                  f"(共 {len(tracking)} 个)", file=sys.stderr)
+        save_tracking_cache(track_file, tracking)
+
+    # 追加检测结果到日志（供验证器分析准确性）
+    detection_log = args.detection_log
+    if hits and detection_log:
+        added = append_to_detection_log(detection_log, hits)
+        if added > 0:
+            print(f"  [检测日志] 追加 {added} 条记录到 {detection_log}",
+                  file=sys.stderr)
 
     if args.json:
         print(json.dumps(hits, ensure_ascii=False, indent=2))
