@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from auto_renew_key import obtain_new_key
+from validate_detections import append_to_detection_log
 
 # ============================================================
 # 配置
@@ -2211,6 +2212,14 @@ def monitor_loop(args, hubs: dict):
         if dedup_file:
             save_dedup_cache(dedup_file, notified)
 
+        # 追加检测结果到日志（供验证器分析准确性）
+        detection_log = getattr(args, 'detection_log', None)
+        if hits and detection_log:
+            dl_added = append_to_detection_log(detection_log, hits)
+            if dl_added > 0:
+                print(f"  [检测日志] 追加 {dl_added} 条记录到 {detection_log}",
+                      file=sys.stderr)
+
         # 将命中结果加入跟踪
         if hits and track_file:
             now_track = beijing_now()
@@ -2384,6 +2393,11 @@ def main():
         default=None,
         help="飞机调换跟踪缓存文件 (跟踪已发现机会的后续飞机变动)",
     )
+    notify_group.add_argument(
+        "--detection-log",
+        default=None,
+        help="检测日志文件 (供验证器追踪预测准确性, 例: .detection_log.json)",
+    )
 
     # ---- 持续监控相关 ----
     monitor_group = parser.add_argument_group("持续监控模式")
@@ -2507,6 +2521,14 @@ def main():
             print(f"  [跟踪] 新增 {added} 个航班到跟踪列表 "
                   f"(共 {len(tracking)} 个)", file=sys.stderr)
         save_tracking_cache(track_file, tracking)
+
+    # 追加检测结果到日志（供验证器分析准确性）
+    detection_log = args.detection_log
+    if hits and detection_log:
+        added = append_to_detection_log(detection_log, hits)
+        if added > 0:
+            print(f"  [检测日志] 追加 {added} 条记录到 {detection_log}",
+                  file=sys.stderr)
 
     if args.json:
         print(json.dumps(hits, ensure_ascii=False, indent=2))
