@@ -16,6 +16,7 @@
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -494,12 +495,193 @@ def create_github_issue(entry: dict, validation: dict,
 
 
 # ============================================================
+# 验证结果邮件通知
+# ============================================================
+
+def build_validation_email_html(results: list) -> str:
+    """构建验证结果汇总邮件 HTML"""
+    now_str = beijing_now().strftime("%Y-%m-%d %H:%M")
+    total = len(results)
+    good = sum(1 for r in results if r["accuracy"] in ("good", "fair"))
+    bad = sum(1 for r in results if r["accuracy"] == "false_positive")
+    over = sum(1 for r in results if r["accuracy"] == "overpredicted")
+    under = sum(1 for r in results if r["accuracy"] == "underpredicted")
+    cancelled = sum(1 for r in results if r["accuracy"] == "cancelled")
+    swapped = sum(1 for r in results if r.get("aircraft_changed"))
+
+    accuracy_rate = round(good / total * 100) if total > 0 else 0
+    banner_bg = "#27ae60" if accuracy_rate >= 70 else (
+        "#e67e22" if accuracy_rate >= 40 else "#c0392b")
+
+    rows_html = ""
+    for r in results:
+        entry = r["entry"]
+        val = r["validation"]
+        acc = val["accuracy"]
+
+        # 准确性颜色和标签
+        acc_colors = {
+            "good": ("#27ae60", "准确"), "fair": ("#2ecc71", "基本准确"),
+            "false_positive": ("#c0392b", "误报"),
+            "overpredicted": ("#e67e22", "偏高"),
+            "underpredicted": ("#3498db", "偏低"),
+            "cancelled": ("#95a5a6", "取消"),
+        }
+        acc_color, acc_label = acc_colors.get(acc, ("#95a5a6", acc))
+
+        swap_tag = ""
+        if val.get("aircraft_changed"):
+            swap_type = "机型更换" if val.get("type_changed") else "同型调换"
+            swap_tag = (f' <span style="background:#9b59b6; color:white; '
+                        f'padding:1px 6px; border-radius:3px; '
+                        f'font-size:11px;">{swap_type}</span>')
+
+        issue_link = ""
+        if val.get("issue_url"):
+            issue_link = (f' <a href="{val["issue_url"]}" '
+                          f'style="color:#3498db; font-size:11px;">'
+                          f'Issue #{val.get("issue_number", "")}</a>')
+
+        prob = entry.get("probability", "")
+        prob_str = f"{prob}%" if prob else ""
+
+        rows_html += f"""
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:8px; font-weight:bold;">
+            {entry['flight_no']}<br/>
+            <span style="font-weight:normal; color:#666; font-size:12px;">
+            {entry['route']}</span>
+          </td>
+          <td style="padding:8px; text-align:center;">
+            <span style="background:{acc_color}; color:white;
+              padding:3px 10px; border-radius:10px; font-size:12px;
+              font-weight:bold;">{acc_label}</span>
+            {swap_tag}{issue_link}
+          </td>
+          <td style="padding:8px; text-align:center; font-size:13px;">
+            {prob_str}
+          </td>
+          <td style="padding:8px; text-align:center; font-size:13px;">
+            预测 {entry['predicted_delay_min']}分<br/>
+            实际 {val['actual_delay_min']}分<br/>
+            <span style="color:{acc_color};">误差 {val['prediction_error_min']}分</span>
+          </td>
+          <td style="padding:8px; font-size:12px; color:#666;">
+            {val.get('root_cause', '')}
+          </td>
+        </tr>"""
+
+    return f"""
+    <div style="font-family:Arial,sans-serif; max-width:800px; margin:auto;">
+      <div style="background:{banner_bg}; color:white; padding:16px 20px;
+              border-radius:8px 8px 0 0;">
+        <h2 style="margin:0;">预测准确性验证报告</h2>
+        <p style="margin:6px 0 0; opacity:0.9;">{now_str}</p>
+      </div>
+
+      <div style="background:#f8f9fa; padding:16px 20px; display:flex;
+              gap:20px; flex-wrap:wrap;">
+        <div style="text-align:center; flex:1;">
+          <div style="font-size:28px; font-weight:bold; color:{banner_bg};">
+            {accuracy_rate}%</div>
+          <div style="color:#666; font-size:13px;">准确率</div>
+        </div>
+        <div style="text-align:center; flex:1;">
+          <div style="font-size:28px; font-weight:bold;">{total}</div>
+          <div style="color:#666; font-size:13px;">验证总数</div>
+        </div>
+        <div style="text-align:center; flex:1;">
+          <div style="font-size:28px; font-weight:bold; color:#27ae60;">
+            {good}</div>
+          <div style="color:#666; font-size:13px;">准确</div>
+        </div>
+        <div style="text-align:center; flex:1;">
+          <div style="font-size:28px; font-weight:bold; color:#c0392b;">
+            {bad}</div>
+          <div style="color:#666; font-size:13px;">误报</div>
+        </div>
+        <div style="text-align:center; flex:1;">
+          <div style="font-size:28px; font-weight:bold; color:#9b59b6;">
+            {swapped}</div>
+          <div style="color:#666; font-size:13px;">飞机调换</div>
+        </div>
+      </div>
+
+      <table style="width:100%; border-collapse:collapse; margin-top:8px;">
+        <thead>
+          <tr style="background:#34495e; color:white;">
+            <th style="padding:10px; text-align:left;">航班</th>
+            <th style="padding:10px; text-align:center;">结果</th>
+            <th style="padding:10px; text-align:center;">概率</th>
+            <th style="padding:10px; text-align:center;">延误对比</th>
+            <th style="padding:10px; text-align:left;">根因</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+
+      <div style="padding:12px 20px; background:#ecf0f1; color:#666;
+              font-size:12px; border-radius:0 0 8px 8px; margin-top:4px;">
+        准确 {good} | 误报 {bad} | 偏高 {over} | 偏低 {under}
+        | 取消 {cancelled} | 飞机调换 {swapped}
+      </div>
+    </div>"""
+
+
+def send_validation_email(to_addr: str, resend_key: str,
+                          results: list) -> bool:
+    """发送验证结果邮件"""
+    if not results:
+        return False
+
+    total = len(results)
+    good = sum(1 for r in results if r["accuracy"] in ("good", "fair"))
+    bad = sum(1 for r in results if r["accuracy"] == "false_positive")
+    rate = round(good / total * 100) if total > 0 else 0
+
+    subject = (f"[准确性报告] 验证{total}条 "
+               f"准确率{rate}% 误报{bad}条")
+
+    html = build_validation_email_html(results)
+
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Flight Monitor <onboarding@resend.dev>",
+                "to": [to_addr],
+                "subject": subject,
+                "html": html,
+            },
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            print(f"  [邮件] 验证报告已发送到 {to_addr}", file=sys.stderr)
+            return True
+        else:
+            print(f"  [邮件失败] Resend 返回 {resp.status_code}: {resp.text}",
+                  file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"  [邮件失败] {e}", file=sys.stderr)
+        return False
+
+
+# ============================================================
 # 主验证流程
 # ============================================================
 
 def run_validation(api_key: str, log_file: str, repo: str = None,
                    auto_renew: bool = False, verbose: bool = False,
-                   create_issues: bool = True) -> tuple[int, int]:
+                   create_issues: bool = True,
+                   email: str = None,
+                   resend_key: str = None) -> tuple[int, int]:
     """
     执行一轮验证。
     返回 (validated_count, issues_created)。
@@ -512,6 +694,7 @@ def run_validation(api_key: str, log_file: str, repo: str = None,
 
     now = beijing_now()
     api = SimpleAPI(api_key, auto_renew=auto_renew)
+    validation_results = []  # 收集本轮验证结果，用于发邮件
 
     validated_count = 0
     issues_created = 0
@@ -550,6 +733,11 @@ def run_validation(api_key: str, log_file: str, repo: str = None,
         entry["validated"] = True
         entry["validation"] = validation
         validated_count += 1
+        validation_results.append({
+            "entry": entry,
+            "validation": validation,
+            "accuracy": validation["accuracy"],
+        })
 
         accuracy = validation["accuracy"]
         error = validation["prediction_error_min"]
@@ -597,6 +785,10 @@ def run_validation(api_key: str, log_file: str, repo: str = None,
           f"本次验证 {validated_count} "
           f"(准确 {good_count}, Issue {issues_created})",
           file=sys.stderr)
+
+    # 发送验证结果邮件
+    if validation_results and email and resend_key:
+        send_validation_email(email, resend_key, validation_results)
 
     return validated_count, issues_created
 
@@ -663,8 +855,22 @@ def main():
         action="store_true",
         help="详细输出",
     )
+    parser.add_argument(
+        "--email",
+        default=None,
+        help="验证结果通知邮箱",
+    )
+    parser.add_argument(
+        "--resend-key",
+        default=None,
+        help="Resend API Key (也可通过环境变量 RESEND_API_KEY 设置)",
+    )
 
     args = parser.parse_args()
+
+    # Resend Key: CLI > 环境变量
+    if not args.resend_key:
+        args.resend_key = os.environ.get("RESEND_API_KEY")
 
     if args.monitor:
         print(f"\n  [验证器] 持续验证模式 — "
@@ -677,6 +883,8 @@ def main():
                     auto_renew=args.auto_renew,
                     verbose=args.verbose,
                     create_issues=not args.no_issues,
+                    email=args.email,
+                    resend_key=args.resend_key,
                 )
             except Exception as e:
                 print(f"  [验证器异常] {e}", file=sys.stderr)
@@ -689,6 +897,8 @@ def main():
             auto_renew=args.auto_renew,
             verbose=args.verbose,
             create_issues=not args.no_issues,
+            email=args.email,
+            resend_key=args.resend_key,
         )
 
 

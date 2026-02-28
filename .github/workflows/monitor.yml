@@ -20,6 +20,8 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
 
     steps:
       - name: Checkout
@@ -62,7 +64,6 @@ jobs:
       - name: Run detection
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
         run: |
           HUB_ARG=""
           if [ -n "${{ github.event.inputs.hub }}" ]; then
@@ -81,13 +82,15 @@ jobs:
           # exit 0: 无机会; exit 1: 有机会 (已通过邮件通知)
           # || true: 无论结果如何都继续（保存缓存）
 
-      # 运行验证器 — 检查历史预测的准确性，不靠谱的自动提 Issue
+      # 运行验证器 — 检查历史预测的准确性，不靠谱的自动提 Issue + 发邮件
       - name: Validate predictions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
           python validate_detections.py \
             --auto-renew \
             --log .detection_log.json \
+            --email "$NOTIFY_EMAIL" \
             -v \
             2>&1 || true

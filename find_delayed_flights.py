@@ -30,7 +30,13 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from auto_renew_key import obtain_new_key
-from validate_detections import append_to_detection_log
+
+try:
+    from validate_detections import append_to_detection_log
+except ImportError:
+    # 验证器不可用时，检测日志功能降级为空操作
+    def append_to_detection_log(filepath, hits):
+        return 0
 
 # ============================================================
 # 配置
