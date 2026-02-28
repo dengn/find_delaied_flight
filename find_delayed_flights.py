@@ -68,9 +68,44 @@ CZ_HUBS = {
         "PKX", "CTU", "TFU", "CKG", "WUH", "CSX", "NKG", "XIY",
         "CGO", "DLC", "SHE", "TAO", "HRB",
     ],
+    # ---- 小型机场 —— 运力有限，前序延误传导率高，预测更可靠 ----
+    "KWE": [  # 贵阳 —— 南航运力少，调机难
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG",
+    ],
+    "NNG": [  # 南宁 —— 南航窄体机为主，调机余地小
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK",
+    ],
+    "KHN": [  # 南昌 —— 航班量少，基本无调机可能
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "LHW": [  # 兰州 —— 西北小场，南航运力极少
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC",
+    ],
+    "HET": [  # 呼和浩特 —— 北方小场，调机困难
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX",
+    ],
+    "INC": [  # 银川 —— 西北小场，运力极少
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY",
+    ],
+    "WNZ": [  # 温州 —— 非枢纽，南航航班少
+        "CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "FOC": [  # 福州 —— 非南航基地，运力有限
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG",
+    ],
+    "SYX": [  # 三亚 —— 旅游城市，南航非驻场大量航班
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO",
+    ],
+    "TNA": [  # 济南 —— 航班量少，调机余地小
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "TSN": [  # 天津 —— 非南航基地
+        "CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
 }
 
 # 南航二线基地及常见航线（天气智能扫描时动态启用）
+# 注意：小机场已提升到 CZ_HUBS，这里只保留中型枢纽
 CZ_SECONDARY_HUBS = {
     "WUH": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "XIY", "HAK"],
     "CSX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "NKG", "XIY", "HAK"],
@@ -84,20 +119,31 @@ CZ_SECONDARY_HUBS = {
     "HAK": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO", "NKG"],
     "SHE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
     "TAO": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
-    "NNG": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK"],
-    "KWE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG"],
     "HRB": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "XIY"],
-    "FOC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
-    "SYX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO"],
-    "TNA": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
-    "KHN": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
-    "LHW": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC"],
-    "HET": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX"],
-    "INC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY"],
-    "WNZ": ["CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG"],
     "XMN": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
-    "TSN": ["CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
 }
+
+# 枢纽可靠性分级 —— 大枢纽机队充裕可调机（预测不可靠），小机场运力少（预测可靠）
+# high: 运力极少，前序延误几乎100%传导，很难调机
+# medium: 有一定运力，偶尔可以调机
+# low: 大枢纽，机队充裕，航司调机能力强，前序延误不一定传导
+HUB_RELIABILITY = {
+    # 大枢纽 —— 调机概率高，预测不可靠
+    "CAN": "low", "PKX": "low", "SZX": "low", "PVG": "low",
+    # 中型枢纽 —— 有调机可能但不确定
+    "URC": "medium", "WUH": "medium", "CSX": "medium", "CKG": "medium",
+    "KMG": "medium", "XIY": "medium", "HGH": "medium", "NKG": "medium",
+    "CGO": "medium", "HAK": "medium", "DLC": "medium", "SHE": "medium",
+    "TAO": "medium", "HRB": "medium", "XMN": "medium", "CTU": "medium",
+    "TFU": "medium",
+    # 小机场 —— 运力少，调机几乎不可能，预测可靠
+    "KWE": "high", "NNG": "high", "KHN": "high", "LHW": "high",
+    "HET": "high", "INC": "high", "WNZ": "high", "FOC": "high",
+    "SYX": "high", "TNA": "high", "TSN": "high", "ZUH": "high",
+    "SJW": "high", "XNN": "high", "MDG": "high", "YIH": "high",
+    "JHG": "high", "KRL": "high", "AKU": "high", "BHY": "high",
+}
+
 
 # 易受天气影响的小型/高原/偏远机场（纳入天气预扫描范围）
 WEATHER_SENSITIVE_AIRPORTS = [
@@ -916,6 +962,7 @@ def run_detection(api_key: str, date: str, hubs: dict,
             hit = analyze_inbound_chain(fl, inbound, now)
             if hit:
                 hit["hub"] = hub
+                hit["hub_reliability"] = HUB_RELIABILITY.get(hub, "medium")
                 hit["airport_situation"] = airport_sit
                 hit["hub_weather"] = weather_text
                 all_hits.append(hit)
@@ -977,8 +1024,11 @@ def run_detection(api_key: str, date: str, hubs: dict,
               f"{api.error_count} 次失败)")
         return all_hits, summary
 
-    # 排序：优先级(前序超时未起飞)在前，然后按预估延误时间降序
-    all_hits.sort(key=lambda h: (h.get("is_priority", False),
+    # 排序：可靠性高的优先 → 前序超时未起飞 → 预估延误时间降序
+    _reliability_order = {"high": 2, "medium": 1, "low": 0}
+    all_hits.sort(key=lambda h: (_reliability_order.get(
+                                     h.get("hub_reliability", "medium"), 1),
+                                 h.get("is_priority", False),
                                  h["estimated_delay_min"]),
                   reverse=True)
 
@@ -996,8 +1046,10 @@ def run_detection(api_key: str, date: str, hubs: dict,
         is_priority = hit.get("is_priority", False)
 
         priority_tag = " ⚠️ 重点关注" if is_priority else ""
+        reliability = hit.get("hub_reliability", "medium")
+        rel_tag = {"high": " [可靠]", "low": " [调机风险]"}.get(reliability, "")
         print(f"  ┌─[{i}] {hit['flight']}  "
-              f"{hit['route']}  ({hit['dep_city']}){priority_tag}")
+              f"{hit['route']}  ({hit['dep_city']}){priority_tag}{rel_tag}")
         if is_priority:
             print(f"  │ *** 前序航班已超计划起飞时间"
                   f"{hit.get('inbound_overdue_min', 0)}分钟仍未起飞! ***")
@@ -1095,6 +1147,20 @@ def build_email_html(hits: list) -> str:
                 'font-size:12px; font-weight:bold;">'
                 f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
 
+        # 可靠性标签
+        reliability = hit.get("hub_reliability", "medium")
+        reliability_badge = ""
+        if reliability == "high":
+            reliability_badge = (
+                '<span style="display:inline-block; padding:2px 8px; '
+                'background:#27ae60; color:white; border-radius:3px; '
+                'font-size:11px; margin-left:8px;">可靠 — 小机场难调机</span>')
+        elif reliability == "low":
+            reliability_badge = (
+                '<span style="display:inline-block; padding:2px 8px; '
+                'background:#f39c12; color:white; border-radius:3px; '
+                'font-size:11px; margin-left:8px;">调机风险 — 大枢纽</span>')
+
         header_bg = "#ffe0e0" if is_priority else "#fff3f3"
 
         # 后续航班：航司调整时间行
@@ -1128,6 +1194,7 @@ def build_email_html(hits: list) -> str:
           <td colspan="2" style="padding:12px; background:{header_bg};">
             <h3 style="margin:0; color:#c0392b;">
               [{i}] {hit['flight']}  {hit['route']}  ({hit['dep_city']})
+              {reliability_badge}
             </h3>
             {priority_badge}
           </td>
@@ -1366,6 +1433,20 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                     'font-size:11px; font-weight:bold;">'
                     f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
 
+            # 可靠性标签
+            rel = hit.get("hub_reliability", "medium")
+            rel_html = ""
+            if rel == "high":
+                rel_html = (
+                    '<span style="display:inline-block; padding:2px 6px; '
+                    'background:#27ae60; color:white; border-radius:3px; '
+                    'font-size:10px; margin-left:6px;">可靠</span>')
+            elif rel == "low":
+                rel_html = (
+                    '<span style="display:inline-block; padding:2px 6px; '
+                    'background:#f39c12; color:white; border-radius:3px; '
+                    'font-size:10px; margin-left:6px;">调机风险</span>')
+
             border_color = "#c0392b" if is_priority else "#e74c3c"
             row_bg = "#ffe5e5" if is_priority else "#fff5f5"
 
@@ -1395,6 +1476,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                 <div style="font-weight:bold; color:#c0392b; font-size:15px;">
                   [{i}] {hit['flight']} &nbsp; {hit['route']}
                   &nbsp; ({hit['dep_city']})
+                  {rel_html}
                 </div>
                 {priority_html}
                 <div style="margin-top:6px; font-size:13px;">

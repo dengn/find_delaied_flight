@@ -106,6 +106,7 @@ def append_to_detection_log(filepath: str, hits: list) -> int:
             "inbound_delay_min": hit.get("inbound_delay_min", 0),
             "inbound_state": hit.get("inbound_state", ""),
             "hub": hit.get("hub", ""),
+            "hub_reliability": hit.get("hub_reliability", "medium"),
             "is_priority": hit.get("is_priority", False),
             "validated": False,
             "validation": None,
@@ -272,7 +273,7 @@ def analyze_root_cause(entry: dict, accuracy: str,
     """分析预测失败的根因"""
     reasons = []
     hub = entry.get("hub", "")
-    big_hubs = ("CAN", "PKX", "SZX", "PVG")
+    hub_reliability = entry.get("hub_reliability", "medium")
 
     if accuracy == "false_positive":
         if aircraft_changed:
@@ -281,10 +282,14 @@ def analyze_root_cause(entry: dict, accuracy: str,
                 f"飞机被{swap_type} "
                 f"({entry['aircraft']}→实际机号), "
                 f"前序延误通过调机解决")
-            if hub in big_hubs:
+            if hub_reliability == "low":
                 reasons.append(
-                    f"{hub}为大枢纽，机队充裕调机能力强，"
+                    f"{hub}为大枢纽(可靠性=low)，机队充裕调机能力强，"
                     f"应降低纯前序延误预测的置信度")
+            elif hub_reliability == "high":
+                reasons.append(
+                    f"{hub}为小机场(可靠性=high)但仍发生调机，"
+                    f"该机场调机能力可能被低估")
         else:
             reasons.append(
                 "飞机未调换但航班准时，"
