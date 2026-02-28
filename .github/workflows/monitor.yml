@@ -20,6 +20,8 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
 
     steps:
       - name: Checkout
@@ -50,11 +52,18 @@ jobs:
           key: tracking-${{ github.run_id }}
           restore-keys: tracking-
 
-      # 运行检测 + 自动邮件通知 + 飞机调换跟踪
+      # 恢复检测日志（跨运行持久化，供验证器分析）
+      - name: Restore detection log
+        uses: actions/cache@v4
+        with:
+          path: .detection_log.json
+          key: detlog-${{ github.run_id }}
+          restore-keys: detlog-
+
+      # 运行检测 + 自动邮件通知 + 飞机调换跟踪 + 检测日志
       - name: Run detection
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
         run: |
           HUB_ARG=""
           if [ -n "${{ github.event.inputs.hub }}" ]; then
@@ -66,8 +75,22 @@ jobs:
             --email "$NOTIFY_EMAIL" \
             --dedup-file .notified_cache.json \
             --track-file .tracking_cache.json \
+            --detection-log .detection_log.json \
             --json \
             $HUB_ARG \
             2>&1 || true
           # exit 0: 无机会; exit 1: 有机会 (已通过邮件通知)
           # || true: 无论结果如何都继续（保存缓存）
+
+      # 运行验证器 — 检查历史预测的准确性，不靠谱的自动提 Issue + 发邮件
+      - name: Validate predictions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: |
+          python validate_detections.py \
+            --auto-renew \
+            --log .detection_log.json \
+            --email "$NOTIFY_EMAIL" \
+            -v \
+            2>&1 || true

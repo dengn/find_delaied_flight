@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .notified_cache.json
 .tracking_cache.json
+.detection_log.json
 .cz_award_cache.json
 cz_award_results.json
 ba_search_*.png

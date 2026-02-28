@@ -31,6 +31,13 @@ import requests
 
 from auto_renew_key import obtain_new_key
 
+try:
+    from validate_detections import append_to_detection_log
+except ImportError:
+    # 验证器不可用时，检测日志功能降级为空操作
+    def append_to_detection_log(filepath, hits):
+        return 0
+
 # ============================================================
 # 配置
 # ============================================================
@@ -67,9 +74,44 @@ CZ_HUBS = {
         "PKX", "CTU", "TFU", "CKG", "WUH", "CSX", "NKG", "XIY",
         "CGO", "DLC", "SHE", "TAO", "HRB",
     ],
+    # ---- 小型机场 —— 运力有限，前序延误传导率高，预测更可靠 ----
+    "KWE": [  # 贵阳 —— 南航运力少，调机难
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG",
+    ],
+    "NNG": [  # 南宁 —— 南航窄体机为主，调机余地小
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK",
+    ],
+    "KHN": [  # 南昌 —— 航班量少，基本无调机可能
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "LHW": [  # 兰州 —— 西北小场，南航运力极少
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC",
+    ],
+    "HET": [  # 呼和浩特 —— 北方小场，调机困难
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX",
+    ],
+    "INC": [  # 银川 —— 西北小场，运力极少
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY",
+    ],
+    "WNZ": [  # 温州 —— 非枢纽，南航航班少
+        "CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "FOC": [  # 福州 —— 非南航基地，运力有限
+        "CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG",
+    ],
+    "SYX": [  # 三亚 —— 旅游城市，南航非驻场大量航班
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO",
+    ],
+    "TNA": [  # 济南 —— 航班量少，调机余地小
+        "CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+    "TSN": [  # 天津 —— 非南航基地
+        "CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
 }
 
 # 南航二线基地及常见航线（天气智能扫描时动态启用）
+# 注意：小机场已提升到 CZ_HUBS，这里只保留中型枢纽
 CZ_SECONDARY_HUBS = {
     "WUH": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "XIY", "HAK"],
     "CSX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "NKG", "XIY", "HAK"],
@@ -83,20 +125,31 @@ CZ_SECONDARY_HUBS = {
     "HAK": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO", "NKG"],
     "SHE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
     "TAO": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "WUH"],
-    "NNG": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "KMG", "HAK"],
-    "KWE": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG", "NKG"],
     "HRB": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "XIY"],
-    "FOC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
-    "SYX": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "WUH", "CGO"],
-    "TNA": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
-    "KHN": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
-    "LHW": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY", "URC"],
-    "HET": ["CAN", "PKX", "SZX", "PVG", "HGH", "CKG", "CSX"],
-    "INC": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "XIY"],
-    "WNZ": ["CAN", "PKX", "SZX", "HGH", "CKG", "CSX", "KMG"],
     "XMN": ["CAN", "PKX", "SZX", "PVG", "CKG", "CSX", "WUH", "NKG"],
-    "TSN": ["CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG"],
 }
+
+# 枢纽可靠性分级 —— 大枢纽机队充裕可调机（预测不可靠），小机场运力少（预测可靠）
+# high: 运力极少，前序延误几乎100%传导，很难调机
+# medium: 有一定运力，偶尔可以调机
+# low: 大枢纽，机队充裕，航司调机能力强，前序延误不一定传导
+HUB_RELIABILITY = {
+    # 大枢纽 —— 调机概率高，预测不可靠
+    "CAN": "low", "PKX": "low", "SZX": "low", "PVG": "low",
+    # 中型枢纽 —— 有调机可能但不确定
+    "URC": "medium", "WUH": "medium", "CSX": "medium", "CKG": "medium",
+    "KMG": "medium", "XIY": "medium", "HGH": "medium", "NKG": "medium",
+    "CGO": "medium", "HAK": "medium", "DLC": "medium", "SHE": "medium",
+    "TAO": "medium", "HRB": "medium", "XMN": "medium", "CTU": "medium",
+    "TFU": "medium",
+    # 小机场 —— 运力少，调机几乎不可能，预测可靠
+    "KWE": "high", "NNG": "high", "KHN": "high", "LHW": "high",
+    "HET": "high", "INC": "high", "WNZ": "high", "FOC": "high",
+    "SYX": "high", "TNA": "high", "TSN": "high", "ZUH": "high",
+    "SJW": "high", "XNN": "high", "MDG": "high", "YIH": "high",
+    "JHG": "high", "KRL": "high", "AKU": "high", "BHY": "high",
+}
+
 
 # 易受天气影响的小型/高原/偏远机场（纳入天气预扫描范围）
 WEATHER_SENSITIVE_AIRPORTS = [
@@ -571,6 +624,112 @@ def analyze_airport_situation(all_flights: list) -> dict:
 
 
 # ============================================================
+# 概率评估：综合评估航变机会的可靠性
+# ============================================================
+
+def calculate_probability(hit: dict) -> int:
+    """
+    综合评估航变机会实际发生的概率 (0-99%)。
+
+    因素权重：
+      1. 枢纽调机能力 (±20%)  — 大枢纽容易换飞机，小机场几乎不可能
+      2. 前序航班状态 (基准)   — 未起飞 > 在飞 > 已到达
+      3. 延误幅度 (+0~15%)    — 延误越多，过站越来不及，概率越高
+      4. 前序超时未起飞 (+10%) — 铁定来不及
+      5. 距出发时间 (±5%)     — 越近越来不及调机
+      6. 机场延误态势 (+0~5%) — 整体延误率高时调机更难
+    """
+    prob = 0
+
+    # ---- 因素1: 前序航班状态 (基准分) ----
+    inbound_state = hit.get("inbound_state", "")
+    if hit.get("is_priority"):
+        # 前序超时未起飞 — 基础就极高
+        prob = 88
+    elif inbound_state in ("计划", "延误"):
+        # 前序尚未起飞
+        prob = 82
+    elif inbound_state == "起飞":
+        # 前序在飞，预计到达已确定
+        prob = 75
+    else:
+        # 前序已到达，过站时间不足
+        prob = 70
+
+    # ---- 因素2: 枢纽调机能力 ----
+    reliability = hit.get("hub_reliability", "medium")
+    if reliability == "high":
+        prob += 8    # 小机场，调机概率极低
+    elif reliability == "low":
+        prob -= 18   # 大枢纽，调机概率高
+    else:
+        prob -= 5    # 中型枢纽
+
+    # ---- 因素3: 延误幅度 ----
+    delay = hit.get("estimated_delay_min", 0)
+    if delay >= 180:
+        prob += 10   # 3小时+，几乎不可能正常
+    elif delay >= 120:
+        prob += 7
+    elif delay >= 60:
+        prob += 4
+    elif delay >= 30:
+        prob += 1
+
+    # ---- 因素4: 前序超时未起飞加成 ----
+    overdue_min = hit.get("inbound_overdue_min", 0)
+    if overdue_min >= 60:
+        prob += 5    # 超时1小时+
+    elif overdue_min >= 30:
+        prob += 3
+
+    # ---- 因素5: 距出发时间 ----
+    mins_left = hit.get("minutes_until_departure", 999)
+    if mins_left < 120:
+        prob += 5    # 不到2小时，调机时间都不够
+    elif mins_left < 240:
+        prob += 2
+    elif mins_left > 480:
+        prob -= 3    # 8小时+，有充裕时间调度
+
+    # ---- 因素6: 机场整体延误态势 ----
+    sit = hit.get("airport_situation", {})
+    delay_rate = sit.get("delay_rate", 0)
+    if delay_rate >= 0.4:
+        prob += 5    # 整体延误率高，调机资源更紧张
+    elif delay_rate >= 0.2:
+        prob += 2
+
+    return max(15, min(99, prob))
+
+
+def probability_label(prob: int) -> str:
+    """概率 → 中文标签"""
+    if prob >= 90:
+        return "极高"
+    elif prob >= 75:
+        return "高"
+    elif prob >= 60:
+        return "中等"
+    elif prob >= 45:
+        return "偏低"
+    else:
+        return "低"
+
+
+def probability_color(prob: int) -> str:
+    """概率 → 颜色 (用于邮件HTML)"""
+    if prob >= 85:
+        return "#c0392b"  # 深红
+    elif prob >= 70:
+        return "#e74c3c"  # 红
+    elif prob >= 55:
+        return "#e67e22"  # 橙
+    else:
+        return "#95a5a6"  # 灰
+
+
+# ============================================================
 # 核心：前序延误铁证分析
 # ============================================================
 
@@ -915,8 +1074,10 @@ def run_detection(api_key: str, date: str, hubs: dict,
             hit = analyze_inbound_chain(fl, inbound, now)
             if hit:
                 hit["hub"] = hub
+                hit["hub_reliability"] = HUB_RELIABILITY.get(hub, "medium")
                 hit["airport_situation"] = airport_sit
                 hit["hub_weather"] = weather_text
+                hit["probability"] = calculate_probability(hit)
                 all_hits.append(hit)
 
         if verbose:
@@ -976,8 +1137,8 @@ def run_detection(api_key: str, date: str, hubs: dict,
               f"{api.error_count} 次失败)")
         return all_hits, summary
 
-    # 排序：优先级(前序超时未起飞)在前，然后按预估延误时间降序
-    all_hits.sort(key=lambda h: (h.get("is_priority", False),
+    # 排序：概率从高到低（概率已综合了可靠性、前序状态、延误幅度等）
+    all_hits.sort(key=lambda h: (h.get("probability", 50),
                                  h["estimated_delay_min"]),
                   reverse=True)
 
@@ -994,9 +1155,12 @@ def run_detection(api_key: str, date: str, hubs: dict,
         mins_remain = mins_left % 60
         is_priority = hit.get("is_priority", False)
 
+        prob = hit.get("probability", 50)
+        prob_label = probability_label(prob)
         priority_tag = " ⚠️ 重点关注" if is_priority else ""
         print(f"  ┌─[{i}] {hit['flight']}  "
-              f"{hit['route']}  ({hit['dep_city']}){priority_tag}")
+              f"{hit['route']}  ({hit['dep_city']})"
+              f"  【{prob}% {prob_label}】{priority_tag}")
         if is_priority:
             print(f"  │ *** 前序航班已超计划起飞时间"
                   f"{hit.get('inbound_overdue_min', 0)}分钟仍未起飞! ***")
@@ -1094,6 +1258,16 @@ def build_email_html(hits: list) -> str:
                 'font-size:12px; font-weight:bold;">'
                 f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
 
+        # 概率标签
+        prob = hit.get("probability", 50)
+        p_color = probability_color(prob)
+        p_label = probability_label(prob)
+        probability_badge = (
+            f'<span style="display:inline-block; padding:3px 12px; '
+            f'background:{p_color}; color:white; border-radius:12px; '
+            f'font-size:14px; font-weight:bold; margin-left:8px;">'
+            f'{prob}% {p_label}</span>')
+
         header_bg = "#ffe0e0" if is_priority else "#fff3f3"
 
         # 后续航班：航司调整时间行
@@ -1127,6 +1301,7 @@ def build_email_html(hits: list) -> str:
           <td colspan="2" style="padding:12px; background:{header_bg};">
             <h3 style="margin:0; color:#c0392b;">
               [{i}] {hit['flight']}  {hit['route']}  ({hit['dep_city']})
+              {probability_badge}
             </h3>
             {priority_badge}
           </td>
@@ -1227,16 +1402,21 @@ def build_email_html(hits: list) -> str:
 
 def send_email(to_addr: str, resend_key: str, hits: list) -> bool:
     """通过 Resend API 发送航变提醒邮件（免授权码）"""
-    subject = (f"[航变提醒] 发现 {len(hits)} 个机会! "
-               f"{hits[0]['flight']} 预延{hits[0]['estimated_delay_min']}分钟")
+    top = hits[0]
+    top_prob = top.get('probability', 50)
+    subject = (f"[航变提醒] {len(hits)}个机会 "
+               f"最高{top_prob}% | "
+               f"{top['flight']} 延{top['estimated_delay_min']}分")
     html = build_email_html(hits)
 
     # 纯文本备用
     text_lines = []
     for i, hit in enumerate(hits, 1):
         priority_tag = "[重点] " if hit.get("is_priority") else ""
+        hit_prob = hit.get("probability", 50)
         text_lines.append(
             f"{priority_tag}[{i}] {hit['flight']} {hit['route']} "
+            f"概率{hit_prob}% "
             f"预估延误{hit['estimated_delay_min']}分钟 "
             f"状态:{hit['current_state']}")
         text_lines.append(
@@ -1365,6 +1545,16 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                     'font-size:11px; font-weight:bold;">'
                     f'⚠ 重点关注 — 前序超时{overdue_min}分钟未起飞</span></div>')
 
+            # 概率标签
+            prob = hit.get("probability", 50)
+            p_color = probability_color(prob)
+            p_label = probability_label(prob)
+            prob_html = (
+                f'<span style="display:inline-block; padding:2px 8px; '
+                f'background:{p_color}; color:white; border-radius:10px; '
+                f'font-size:12px; font-weight:bold; margin-left:6px;">'
+                f'{prob}% {p_label}</span>')
+
             border_color = "#c0392b" if is_priority else "#e74c3c"
             row_bg = "#ffe5e5" if is_priority else "#fff5f5"
 
@@ -1394,6 +1584,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                 <div style="font-weight:bold; color:#c0392b; font-size:15px;">
                   [{i}] {hit['flight']} &nbsp; {hit['route']}
                   &nbsp; ({hit['dep_city']})
+                  {prob_html}
                 </div>
                 {priority_html}
                 <div style="margin-top:6px; font-size:13px;">
@@ -1542,8 +1733,9 @@ def send_summary_email(to_addr: str, resend_key: str,
     hub_names = ", ".join(summary.get("hubs", {}).keys())
 
     if n_hits > 0:
-        subject = (f"[航变报告] {date} 发现 {n_hits} 个机会! "
-                   f"({hub_names})")
+        top_prob = max(h.get("probability", 50) for h in hits)
+        subject = (f"[航变报告] {date} {n_hits}个机会 "
+                   f"最高{top_prob}% ({hub_names})")
     else:
         subject = f"[航变报告] {date} {run_time} 未发现机会 ({hub_names})"
 
@@ -1568,8 +1760,10 @@ def send_summary_email(to_addr: str, resend_key: str,
         text_lines.append(f"发现 {n_hits} 个航变机会:")
         for i, h in enumerate(hits, 1):
             priority_tag = "[重点] " if h.get("is_priority") else ""
+            h_prob = h.get("probability", 50)
             text_lines.append(
                 f"  {priority_tag}[{i}] {h['flight']} {h['route']} "
+                f"{h_prob}% "
                 f"预延{h['estimated_delay_min']}分 "
                 f"状态:{h['current_state']}")
             text_lines.append(
@@ -2211,6 +2405,14 @@ def monitor_loop(args, hubs: dict):
         if dedup_file:
             save_dedup_cache(dedup_file, notified)
 
+        # 追加检测结果到日志（供验证器分析准确性）
+        detection_log = getattr(args, 'detection_log', None)
+        if hits and detection_log:
+            dl_added = append_to_detection_log(detection_log, hits)
+            if dl_added > 0:
+                print(f"  [检测日志] 追加 {dl_added} 条记录到 {detection_log}",
+                      file=sys.stderr)
+
         # 将命中结果加入跟踪
         if hits and track_file:
             now_track = beijing_now()
@@ -2384,6 +2586,11 @@ def main():
         default=None,
         help="飞机调换跟踪缓存文件 (跟踪已发现机会的后续飞机变动)",
     )
+    notify_group.add_argument(
+        "--detection-log",
+        default=None,
+        help="检测日志文件 (供验证器追踪预测准确性, 例: .detection_log.json)",
+    )
 
     # ---- 持续监控相关 ----
     monitor_group = parser.add_argument_group("持续监控模式")
@@ -2507,6 +2714,14 @@ def main():
             print(f"  [跟踪] 新增 {added} 个航班到跟踪列表 "
                   f"(共 {len(tracking)} 个)", file=sys.stderr)
         save_tracking_cache(track_file, tracking)
+
+    # 追加检测结果到日志（供验证器分析准确性）
+    detection_log = args.detection_log
+    if hits and detection_log:
+        added = append_to_detection_log(detection_log, hits)
+        if added > 0:
+            print(f"  [检测日志] 追加 {added} 条记录到 {detection_log}",
+                  file=sys.stderr)
 
     if args.json:
         print(json.dumps(hits, ensure_ascii=False, indent=2))
