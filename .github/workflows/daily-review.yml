@@ -1,0 +1,51 @@
+name: Daily Review
+
+on:
+  schedule:
+    # 北京时间 06:00 = UTC 22:00 (前一天)
+    - cron: '0 22 * * *'
+
+  # 支持手动触发（测试用）
+  workflow_dispatch:
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 恢复检测日志（由 monitor.yml 写入）
+      - name: Restore detection log
+        uses: actions/cache@v4
+        with:
+          path: .detection_log.json
+          key: detlog-${{ github.run_id }}
+          restore-keys: detlog-
+
+      # 运行每日回测
+      - name: Run daily review
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python validate_detections.py \
+            --daily-review \
+            --auto-renew \
+            --log .detection_log.json \
+            --email "$NOTIFY_EMAIL" \
+            -v \
+            2>&1 || true
