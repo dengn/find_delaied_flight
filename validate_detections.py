@@ -107,6 +107,7 @@ def append_to_detection_log(filepath: str, hits: list) -> int:
             "inbound_state": hit.get("inbound_state", ""),
             "hub": hit.get("hub", ""),
             "hub_reliability": hit.get("hub_reliability", "medium"),
+            "probability": hit.get("probability", 50),
             "is_priority": hit.get("is_priority", False),
             "validated": False,
             "validation": None,
