@@ -351,6 +351,9 @@ MAX_PLANNED_GAP_MINUTES = 240  # 4小时
 # 后续航班距现在至少要有多少分钟，才有买票窗口
 MIN_BOOKING_WINDOW_MINUTES = 120  # 2小时
 
+# 国内航班延误判定标准：撤轮挡时间比计划起飞晚 > 15分钟即为延误
+OFFICIAL_DELAY_THRESHOLD = 15
+
 # 请求间隔（秒）
 REQUEST_INTERVAL = 0.6
 
@@ -614,7 +617,7 @@ def analyze_airport_situation(all_flights: list) -> dict:
             actual_dep = parse_time(fl.get("FlightDeptimeReadyDate", ""))
         if plan_dep and actual_dep:
             diff = (actual_dep - plan_dep).total_seconds() / 60
-            if diff > 15:
+            if diff > OFFICIAL_DELAY_THRESHOLD:
                 delayed += 1
                 delay_minutes_list.append(diff)
 

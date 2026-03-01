@@ -38,6 +38,9 @@ VALIDATION_WAIT_HOURS = 3
 API_URL = "https://mcp.variflight.com/api/v1/mcp/data"
 REQUEST_INTERVAL = 0.6
 
+# 国内航班延误判定标准：撤轮挡时间比计划起飞晚 > 15分钟即为延误
+OFFICIAL_DELAY_THRESHOLD = 15
+
 # 创建 Issue 的准确性阈值
 ISSUE_ACCURACY_THRESHOLDS = ("false_positive", "overpredicted")
 
@@ -229,14 +232,14 @@ def validate_entry(api: SimpleAPI, entry: dict) -> dict | None:
     if aircraft_changed and actual_type and entry.get("aircraft_type"):
         type_changed = actual_type != entry["aircraft_type"]
 
-    # 准确性分级
+    # 准确性分级（国标：撤轮挡晚于计划>15分钟即延误）
     if actual_state in ("取消", "提前取消"):
         accuracy = "cancelled"
-    elif actual_delay_min < 15:
+    elif actual_delay_min < OFFICIAL_DELAY_THRESHOLD:
         accuracy = "false_positive"
-    elif actual_delay_min >= 30 and error <= 30:
+    elif actual_delay_min >= OFFICIAL_DELAY_THRESHOLD and error <= 30:
         accuracy = "good"
-    elif actual_delay_min >= 30 and error <= 60:
+    elif actual_delay_min >= OFFICIAL_DELAY_THRESHOLD and error <= 60:
         accuracy = "fair"
     elif predicted_delay > actual_delay_min and error > 60:
         accuracy = "overpredicted"
@@ -992,7 +995,7 @@ def _build_daily_report_html(review_date, results: list,
                   if r.get("validation", {}).get("aircraft_changed"))
     rate = round(good / len(valid_results) * 100) if valid_results else 0
 
-    # 真正出现航变的（延误>=30分钟 或 取消）
+    # 真正出现航变的（延误>15分钟 或 取消）
     real_change = sum(1 for r in valid_results
                       if r["accuracy"] in ("good", "fair",
                                             "underpredicted"))
@@ -1046,7 +1049,7 @@ def _build_daily_report_html(review_date, results: list,
             actual_desc = "无数据"
         elif actual_state in ("取消", "提前取消"):
             actual_desc = "已取消"
-        elif actual_delay >= 30:
+        elif actual_delay > OFFICIAL_DELAY_THRESHOLD:
             actual_desc = f"延误{actual_delay}分钟"
         elif actual_delay > 0:
             actual_desc = f"轻微延误{actual_delay}分"
