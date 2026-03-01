@@ -36,6 +36,23 @@ jobs:
           key: detlog-${{ github.run_id }}
           restore-keys: detlog-
 
+      # 诊断：检查日志文件是否存在
+      - name: Check detection log
+        run: |
+          echo "=== Detection Log Status ==="
+          if [ -f .detection_log.json ]; then
+            echo "File exists"
+            echo "Size: $(wc -c < .detection_log.json) bytes"
+            echo "Entries: $(python3 -c 'import json; f=open(".detection_log.json"); d=json.load(f); print(len(d))' 2>/dev/null || echo 'parse error')"
+          else
+            echo "File NOT found - cache restore may have failed"
+            echo "Creating empty log file"
+            echo '[]' > .detection_log.json
+          fi
+          echo "=== Environment Check ==="
+          echo "NOTIFY_EMAIL: $NOTIFY_EMAIL"
+          echo "RESEND_API_KEY set: ${{ secrets.RESEND_API_KEY != '' }}"
+
       # 运行每日回测
       - name: Run daily review
         env:
@@ -48,4 +65,4 @@ jobs:
             --log .detection_log.json \
             --email "$NOTIFY_EMAIL" \
             -v \
-            2>&1 || true
+            2>&1
