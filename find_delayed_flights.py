@@ -340,6 +340,14 @@ WIDEBODY_TYPES = {"A33", "A34", "A35", "A38", "B74", "B77", "B78", "B76"}
 # 前序航班必须延误超过此阈值（分钟），才认为"明显延误"
 SIGNIFICANT_DELAY_MINUTES = 30
 
+# 后续航班的预估延误必须 >= 此阈值（分钟），才值得通报
+# 10分钟延误根本不算机会，至少要20分钟以上才有实际航变的可能
+MIN_ESTIMATED_DELAY_MINUTES = 20
+
+# 前序计划到达 → 后续计划起飞之间的间隔（分钟）超过此值时，跳过检测
+# 典型场景：隔夜飞机（凌晨到、早上飞），航司有充裕时间调度/换飞机
+MAX_PLANNED_GAP_MINUTES = 240  # 4小时
+
 # 后续航班距现在至少要有多少分钟，才有买票窗口
 MIN_BOOKING_WINDOW_MINUTES = 120  # 2小时
 
@@ -790,6 +798,14 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
     if not inbound_plan_arr or not inbound_est_arr:
         return None
 
+    # 条件0: 隔夜/长间隔过滤
+    # 如果前序计划到达 → 后续计划起飞的间隔 >= 4小时，航司有充裕时间调度
+    # 典型场景：CZ8866 凌晨04:40到 → CZ6600 早上09:15飞，间隔4.5小时
+    # 即使前序晚到，航司有整晚时间换飞机、调度，不影响早班
+    planned_gap = (plan_dep - inbound_plan_arr).total_seconds() / 60
+    if planned_gap >= MAX_PLANNED_GAP_MINUTES:
+        return None
+
     # 条件1: 前序航班明显延误 OR 前序已过起飞时间未起飞
     inbound_delay = (inbound_est_arr - inbound_plan_arr).total_seconds() / 60
     if not inbound_overdue and inbound_delay < SIGNIFICANT_DELAY_MINUTES:
@@ -801,6 +817,11 @@ def analyze_inbound_chain(departing: dict, inbound: dict,
     dep_delay = (earliest_possible_dep - plan_dep).total_seconds() / 60
     if dep_delay <= 0:
         return None  # 过站时间够，能赶上
+
+    # 条件2.5: 预估延误太小不值得
+    # 比如只延误10分钟，根本不算航变机会，至少20分钟以上才有意义
+    if dep_delay < MIN_ESTIMATED_DELAY_MINUTES:
+        return None
 
     # ---- 全部条件满足，构建结果 ----
 
@@ -920,6 +941,8 @@ def run_detection(api_key: str, date: str, hubs: dict,
     print(f"  运行时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  买票窗口: 距起飞 >= {MIN_BOOKING_WINDOW_MINUTES} 分钟")
     print(f"  前序延误阈值: >= {SIGNIFICANT_DELAY_MINUTES} 分钟")
+    print(f"  最低预估延误: >= {MIN_ESTIMATED_DELAY_MINUTES} 分钟")
+    print(f"  隔夜间隔过滤: >= {MAX_PLANNED_GAP_MINUTES} 分钟跳过")
     print(f"{'='*70}\n")
 
     all_hits = []
@@ -1129,7 +1152,8 @@ def run_detection(api_key: str, date: str, hubs: dict,
         print("  - 当前延误的飞机的后续航班已发布航变通知")
         print("  - 前序延误严重但过站时间仍充足")
         print("  - 受影响航班距出发不足2小时（来不及买票）")
-        print("  - 深夜时段隔夜过站充裕，适合白天飞行高峰期运行")
+        print(f"  - 预估延误不足{MIN_ESTIMATED_DELAY_MINUTES}分钟（不算实质性航变机会）")
+        print(f"  - 隔夜/长间隔({MAX_PLANNED_GAP_MINUTES}分钟+)，航司有充裕时间调度")
         print(f"{'='*70}\n")
         summary["api_calls"] = api.call_count
         summary["api_errors"] = api.error_count
@@ -2474,7 +2498,8 @@ def monitor_loop(args, hubs: dict):
 
 def main():
     global SIGNIFICANT_DELAY_MINUTES, MIN_TURNAROUND_NARROW, \
-        MIN_TURNAROUND_WIDE, MIN_BOOKING_WINDOW_MINUTES
+        MIN_TURNAROUND_WIDE, MIN_BOOKING_WINDOW_MINUTES, \
+        MIN_ESTIMATED_DELAY_MINUTES, MAX_PLANNED_GAP_MINUTES
 
     parser = argparse.ArgumentParser(
         description="南航航变机会检测器 — 找到铁定延误但未通知的航班，提前购买里程票",

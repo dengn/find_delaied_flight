@@ -806,14 +806,45 @@ def run_daily_review(api_key: str, log_file: str,
     每日回测：回顾前一天所有检测结果，验证预测准确性并发送日报。
     应在每天早上6点执行 — 此时前一天所有航班都已到达。
     """
-    log = load_detection_log(log_file)
-    if not log:
-        print("  [日报] 检测日志为空，跳过", file=sys.stderr)
-        return
-
     now = beijing_now()
     yesterday = (now - timedelta(days=1)).date()
-    print(f"\n  [日报] 回测日期: {yesterday}", file=sys.stderr)
+
+    # ---- 诊断信息 ----
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"  [日报] 每日回测开始", file=sys.stderr)
+    print(f"  [日报] 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)",
+          file=sys.stderr)
+    print(f"  [日报] 回测日期: {yesterday}", file=sys.stderr)
+    print(f"  [日报] 日志文件: {log_file}", file=sys.stderr)
+    print(f"  [日报] 日志文件存在: {os.path.exists(log_file)}", file=sys.stderr)
+    print(f"  [日报] 邮箱配置: {'已设置' if email else '未设置'} ({email or '-'})",
+          file=sys.stderr)
+    print(f"  [日报] Resend Key: {'已设置' if resend_key else '未设置'}",
+          file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
+
+    log = load_detection_log(log_file)
+    print(f"  [日报] 日志总记录数: {len(log)}", file=sys.stderr)
+
+    if log and verbose:
+        # 打印所有记录的日期分布，帮助诊断
+        date_counts = {}
+        for entry in log:
+            det_time = parse_time(entry.get("detected_at", ""))
+            if det_time:
+                d = str(det_time.date())
+                date_counts[d] = date_counts.get(d, 0) + 1
+        print(f"  [日报] 日志日期分布: {date_counts}", file=sys.stderr)
+
+    if not log:
+        print("  [日报] 检测日志为空", file=sys.stderr)
+        # 日志为空也发邮件，让用户知道系统在运行
+        if email and resend_key:
+            print("  [日报] 发送空日报邮件...", file=sys.stderr)
+            _send_daily_report_email(email, resend_key, yesterday, [], [])
+        else:
+            print("  [日报] 邮件未配置，跳过发送", file=sys.stderr)
+        return
 
     # 筛选前一天检测到的记录
     yesterday_entries = []
@@ -823,10 +854,13 @@ def run_daily_review(api_key: str, log_file: str,
             yesterday_entries.append(entry)
 
     if not yesterday_entries:
-        print(f"  [日报] {yesterday} 无检测记录，跳过", file=sys.stderr)
+        print(f"  [日报] {yesterday} 无检测记录", file=sys.stderr)
         # 即使无记录也发一封空日报，让用户知道系统在正常运行
         if email and resend_key:
+            print("  [日报] 发送空日报邮件...", file=sys.stderr)
             _send_daily_report_email(email, resend_key, yesterday, [], [])
+        else:
+            print("  [日报] 邮件未配置，跳过发送", file=sys.stderr)
         return
 
     print(f"  [日报] {yesterday} 共 {len(yesterday_entries)} 条检测记录",
