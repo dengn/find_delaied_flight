@@ -1,0 +1,28 @@
+name: Keep Alive
+
+on:
+  schedule:
+    # 每月 1 号 03:17 UTC 触发一次（避开整点高峰，减少被丢弃概率）。
+    # 制造一次仓库活动，防止 GitHub 因 60 天无提交而自动停用
+    # monitor.yml / daily-review.yml 等定时工作流。
+    - cron: '17 3 1 * *'
+
+  # 支持手动触发（测试用）
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create empty commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keep-alive (防止定时工作流被自动停用)"
+          git push origin HEAD:${{ github.ref_name }}
