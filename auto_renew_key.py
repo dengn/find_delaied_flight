@@ -2,53 +2,62 @@
 """
 飞常准 API Key 自动续杯工具
 自动注册新账号 → 邮箱激活 → 创建 API Key，实现无限续杯。
-使用 mail.tm 临时邮箱服务接收激活邮件。
+使用 Guerrilla Mail 临时邮箱服务接收激活邮件。
+
+注意：飞常准会按域名封禁常见的一次性邮箱（mail.tm 的 uberip.com、
+guerrillamail.com、sharklasers.com、spam4.me 等均已被封）。
+MAIL_DOMAINS 里按顺序放的是当前仍可通过注册校验的别名域名，
+注册被拒时会自动换下一个，无需改代码。
+Guerrilla Mail 的所有域名共用同一个收件箱，因此换域名不影响收信。
 """
 
-import json
+import html
 import random
+import re
 import string
 import sys
 import time
+import urllib.parse
 
 import requests
 
 VARIFLIGHT_BASE = "https://mcp.variflight.com"
-MAILTM_BASE = "https://api.mail.tm"
+GUERRILLA_BASE = "https://api.guerrillamail.com/ajax.php"
+
+# 候选发信域名，按顺序尝试；被飞常准拒绝时自动降级到下一个
+MAIL_DOMAINS = ["grr.la", "pokemail.net"]
+
+# Guerrilla Mail 要求请求带正常 UA
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
-def get_mail_domain() -> str:
-    """获取 mail.tm 当前可用域名"""
-    resp = requests.get(f"{MAILTM_BASE}/domains", timeout=15)
+class EmailDomainRejected(RuntimeError):
+    """飞常准拒绝了该邮箱域名（一次性邮箱黑名单），可换域名重试"""
+
+
+def open_mailbox() -> tuple[requests.Session, str, str]:
+    """打开临时邮箱会话，返回 (session, sid_token, 邮箱本地名)"""
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    resp = session.get(GUERRILLA_BASE,
+                       params={"f": "get_email_address", "lang": "en"},
+                       timeout=15)
     resp.raise_for_status()
-    data = resp.json()
-    # 兼容两种响应格式: 列表 或 hydra collection
-    if isinstance(data, list):
-        domains = data
-    else:
-        domains = data.get("hydra:member", [])
-    for d in domains:
-        if d.get("isActive"):
-            return d["domain"]
-    raise RuntimeError("mail.tm 没有可用域名")
+    sid = resp.json()["sid_token"]
 
-
-def create_temp_email(domain: str) -> tuple[str, str, str]:
-    """创建临时邮箱，返回 (地址, 密码, token)"""
-    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    addr = f"vfbot_{rand}@{domain}"
-    pwd = "TempMail@2026x"
-
-    resp = requests.post(f"{MAILTM_BASE}/accounts",
-                         json={"address": addr, "password": pwd}, timeout=15)
+    # 自定义本地名，避免用默认随机地址（便于拼接任意别名域名）
+    local = "vfbot" + "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=10))
+    resp = session.get(GUERRILLA_BASE,
+                       params={"f": "set_email_user", "email_user": local,
+                               "lang": "en", "sid_token": sid},
+                       timeout=15)
     resp.raise_for_status()
+    sid = resp.json().get("sid_token", sid)
 
-    # 获取 token
-    resp = requests.post(f"{MAILTM_BASE}/token",
-                         json={"address": addr, "password": pwd}, timeout=15)
-    resp.raise_for_status()
-    token = resp.json()["token"]
-    return addr, pwd, token
+    return session, sid, local
 
 
 def register_variflight(email: str) -> tuple[str, str]:
@@ -62,40 +71,48 @@ def register_variflight(email: str) -> tuple[str, str]:
                                "password": password}, timeout=15)
     data = resp.json()
     if data.get("code") != 200:
+        # 422 且错误定位到 email 字段 = 域名被拉黑，换个域名还有戏
+        for err in data.get("errors") or []:
+            if "email" in (err.get("loc") or []):
+                raise EmailDomainRejected(err.get("msg", "邮箱域名被拒绝"))
         raise RuntimeError(f"注册失败: {data.get('message')}")
 
     return username, password
 
 
-def wait_for_activation_code(mail_token: str, max_wait: int = 60) -> tuple[str, str]:
+def wait_for_activation_code(session: requests.Session, sid: str,
+                             max_wait: int = 120) -> tuple[str, str]:
     """轮询邮箱等待激活邮件，返回 (email, code)"""
-    headers = {"Authorization": f"Bearer {mail_token}"}
     start = time.time()
+    seen: set[str] = set()
 
     while time.time() - start < max_wait:
-        resp = requests.get(f"{MAILTM_BASE}/messages",
-                            headers=headers, timeout=15)
-        raw = resp.json()
-        # 兼容列表或 hydra collection
-        messages = raw if isinstance(raw, list) else raw.get("hydra:member", [])
-        if len(messages) > 0:
-            # 读取第一封邮件
-            msg_id = messages[0]["id"]
-            resp = requests.get(f"{MAILTM_BASE}/messages/{msg_id}",
-                                headers=headers, timeout=15)
-            text = resp.json().get("text", "")
-            # 从文本中提取激活链接
-            for line in text.split("\n"):
-                if "activate?" in line:
-                    line = line.strip()
-                    # 解析 email 和 code 参数
-                    import urllib.parse
-                    parsed = urllib.parse.urlparse(line)
-                    params = urllib.parse.parse_qs(parsed.query)
-                    email = params.get("email", [""])[0]
-                    code = params.get("code", [""])[0]
-                    if email and code:
-                        return email, code
+        resp = session.get(GUERRILLA_BASE,
+                           params={"f": "get_email_list", "offset": 0,
+                                   "sid_token": sid}, timeout=15)
+        for msg in resp.json().get("list") or []:
+            mail_id = str(msg.get("mail_id"))
+            if mail_id in seen:
+                continue
+            seen.add(mail_id)
+
+            detail = session.get(GUERRILLA_BASE,
+                                 params={"f": "fetch_email",
+                                         "email_id": mail_id,
+                                         "sid_token": sid}, timeout=15)
+            # 邮件正文是 HTML，激活链接藏在 <a href> 里
+            body = html.unescape(detail.json().get("mail_body", ""))
+            match = re.search(r"activate\?[^\s\"'<>\)]+", body)
+            if not match:
+                continue
+
+            query = urllib.parse.urlparse("?" + match.group(0).split("?", 1)[1])
+            params = urllib.parse.parse_qs(query.query)
+            email = params.get("email", [""])[0]
+            code = params.get("code", [""])[0]
+            if email and code:
+                return email, code
+
         time.sleep(3)
 
     raise RuntimeError(f"等待激活邮件超时 ({max_wait}s)")
@@ -151,19 +168,32 @@ def obtain_new_key(verbose: bool = True) -> str:
         if verbose:
             print(f"  {msg}", file=sys.stderr)
 
-    log("[1/6] 获取临时邮箱域名...")
-    domain = get_mail_domain()
+    log("[1/6] 创建临时邮箱...")
+    session, sid, local = open_mailbox()
 
-    log(f"[2/6] 创建临时邮箱 (*@{domain})...")
-    email, mail_pwd, mail_token = create_temp_email(domain)
-    log(f"       邮箱: {email}")
+    log("[2/6] 注册飞常准账号...")
+    username = vf_pwd = None
+    rejected = []
+    for domain in MAIL_DOMAINS:
+        email = f"{local}@{domain}"
+        try:
+            username, vf_pwd = register_variflight(email)
+            log(f"       邮箱: {email}")
+            log(f"       用户: {username}")
+            break
+        except EmailDomainRejected as e:
+            rejected.append(domain)
+            log(f"       域名 {domain} 被拒绝 ({e})，尝试下一个...")
 
-    log("[3/6] 注册飞常准账号...")
-    username, vf_pwd = register_variflight(email)
-    log(f"       用户: {username}")
+    if username is None:
+        raise RuntimeError(
+            f"所有邮箱域名均被飞常准拒绝: {', '.join(rejected)}。"
+            "需要在 MAIL_DOMAINS 中补充新的可用域名。")
 
-    log("[4/6] 等待激活邮件...")
-    act_email, act_code = wait_for_activation_code(mail_token)
+    log("[3/6] 等待激活邮件...")
+    act_email, act_code = wait_for_activation_code(session, sid)
+
+    log("[4/6] 激活账号...")
     activate_account(act_email, act_code)
     log("       激活成功")
 

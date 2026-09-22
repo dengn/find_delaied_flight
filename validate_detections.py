@@ -138,6 +138,8 @@ class SimpleAPI:
             "Content-Type": "application/json",
         })
         self._auto_renew = auto_renew
+        self._renew_count = 0
+        self._max_renew = 3
         self._last_call = 0.0
 
     def search_flights(self, dep: str, arr: str, date: str) -> list:
@@ -151,13 +153,19 @@ class SimpleAPI:
                 "params": {"dep": dep, "arr": arr, "date": date}}
         try:
             resp = self.session.post(API_URL, json=body, timeout=30)
-            if resp.status_code == 403:
+            # Key 不可用：401 被吊销 / 403 额度耗尽 / 404 账号已清除。
+            # 余额不足的 message 带充值链接，必须用子串匹配
+            if resp.status_code in (401, 403, 404):
                 try:
                     err = resp.json()
                 except (json.JSONDecodeError, ValueError):
-                    return []
-                if (err.get("message") == "Insufficient balance"
-                        and self._auto_renew):
+                    err = {}
+                message = str(err.get("message", ""))
+                key_dead = (resp.status_code in (401, 404)
+                            or "insufficient balance" in message.lower())
+                if (key_dead and self._auto_renew
+                        and self._renew_count < self._max_renew):
+                    self._renew_count += 1
                     new_key = obtain_new_key(verbose=True)
                     self.api_key = new_key
                     self.session.headers["X-VARIFLIGHT-KEY"] = new_key
@@ -1232,8 +1240,8 @@ def main():
     )
     parser.add_argument(
         "--key", "-k",
-        default="sk-5BvX04jqSMsy42k4OJiekvRjNGxxBulxSf5vQbyCZIw",
-        help="飞常准 API Key",
+        default=None,
+        help="飞常准 API Key (不指定则需配合 --auto-renew 自动获取)",
     )
     parser.add_argument(
         "--log",
@@ -1292,6 +1300,18 @@ def main():
     # Resend Key: CLI > 环境变量
     if not args.resend_key:
         args.resend_key = os.environ.get("RESEND_API_KEY")
+
+    # 未显式指定 Key 时先续杯拿一把可用的
+    if not args.key:
+        if not args.auto_renew:
+            print("[错误] 未指定 API Key，请用 --key 指定，"
+                  "或加 --auto-renew 自动获取", file=sys.stderr)
+            sys.exit(1)
+        try:
+            args.key = obtain_new_key(verbose=args.verbose)
+        except Exception as e:
+            print(f"[错误] 自动获取 Key 失败: {e}", file=sys.stderr)
+            sys.exit(1)
 
     if args.daily_review:
         run_daily_review(
