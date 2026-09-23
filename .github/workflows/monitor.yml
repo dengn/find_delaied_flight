@@ -19,7 +19,9 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 全量扫描约需 7 把 Key（每把续杯 ~85 秒），实测约 28 分钟。
+    # 留到 29 分钟，仍小于 30 分钟的 cron 间隔，避免两次运行重叠。
+    timeout-minutes: 29
     env:
       NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
 
@@ -61,7 +63,13 @@ jobs:
           restore-keys: detlog-
 
       # 运行检测 + 自动邮件通知 + 飞机调换跟踪 + 检测日志
+      # 超时放在步骤级而非 job 级：job 级超时会整体 cancel，
+      # 导致后面的缓存保存步骤被跳过（检测日志因此长期为空）。
+      # 步骤级超时 + continue-on-error 则只中断扫描本身，
+      # 验证器和缓存保存照常执行。
       - name: Run detection
+        timeout-minutes: 24
+        continue-on-error: true
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
