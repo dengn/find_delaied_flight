@@ -392,39 +392,52 @@ class VariFlightAPI:
                 self.call_count += 1
                 resp = self.session.post(API_URL, json=body, timeout=30)
 
-                if resp.status_code == 403:
+                # Key 不可用有三种表现，都只能靠续杯解决，重试无意义：
+                #   401 Invalid API key  —— Key 被吊销
+                #   403 Insufficient balance —— 额度耗尽
+                #   404 User not found   —— 账号已被清除
+                # 注意：余额不足的 message 带有充值链接，必须用子串匹配
+                if resp.status_code in (401, 403, 404):
                     try:
                         err_data = resp.json()
-                        if err_data.get("message") == "Insufficient balance":
-                            if (self._auto_renew
-                                    and self._renew_count < self._max_renew):
-                                self._renew_count += 1
-                                print(f"\n  [续杯 {self._renew_count}/{self._max_renew}]"
-                                      f" API 余额不足，自动获取新 Key...",
-                                      file=sys.stderr)
-                                try:
-                                    new_key = obtain_new_key(verbose=True)
-                                    self.api_key = new_key
-                                    self.session.headers["X-VARIFLIGHT-KEY"] = new_key
-                                    self._balance_warned = False
-                                    print(f"  [续杯] 新 Key 已生效: {new_key[:20]}...",
-                                          file=sys.stderr)
-                                    # 额度到账可能有延迟，多等一会再发请求
-                                    print("  [续杯] 等待 10s 确保额度生效...\n",
-                                          file=sys.stderr)
-                                    time.sleep(10)
-                                    attempt = 0
-                                    continue
-                                except Exception as e:
-                                    print(f"  [续杯失败] {e}", file=sys.stderr)
-                            if not getattr(self, '_balance_warned', False):
-                                print("\n  [错误] API 余额不足 (Insufficient balance)，"
-                                      "请充值后重试。", file=sys.stderr)
-                                self._balance_warned = True
-                            self.error_count += 1
-                            return []
                     except (json.JSONDecodeError, ValueError):
-                        pass
+                        err_data = {}
+                    message = str(err_data.get("message", ""))
+                    key_dead = (resp.status_code in (401, 404)
+                                or "insufficient balance" in message.lower())
+
+                    if key_dead:
+                        if (self._auto_renew
+                                and self._renew_count < self._max_renew):
+                            self._renew_count += 1
+                            print(f"\n  [续杯 {self._renew_count}/{self._max_renew}]"
+                                  f" Key 不可用 ({resp.status_code} {message[:50]})，"
+                                  "自动获取新 Key...", file=sys.stderr)
+                            try:
+                                new_key = obtain_new_key(verbose=True)
+                                self.api_key = new_key
+                                self.session.headers["X-VARIFLIGHT-KEY"] = new_key
+                                self._balance_warned = False
+                                print(f"  [续杯] 新 Key 已生效: {new_key[:20]}...",
+                                      file=sys.stderr)
+                                # 额度到账可能有延迟，多等一会再发请求
+                                print("  [续杯] 等待 10s 确保额度生效...\n",
+                                      file=sys.stderr)
+                                time.sleep(10)
+                                attempt = 0
+                                continue
+                            except Exception as e:
+                                print(f"  [续杯失败] {e}", file=sys.stderr)
+                        if not getattr(self, '_balance_warned', False):
+                            print(f"\n  [错误] API Key 不可用 "
+                                  f"({resp.status_code} {message[:70]})，"
+                                  "请更换 Key 或启用 --auto-renew。",
+                                  file=sys.stderr)
+                            self._balance_warned = True
+                        self.error_count += 1
+                        return []
+
+                    # 403 但不是余额问题 → 触发限速，退避后重试
                     backoff = 3 * (2 ** attempt)
                     if attempt < max_attempts - 1:
                         print(f"  [限速] 等待 {backoff}s 后重试...",
@@ -2527,8 +2540,8 @@ def main():
     )
     parser.add_argument(
         "--key", "-k",
-        default="sk-5BvX04jqSMsy42k4OJiekvRjNGxxBulxSf5vQbyCZIw",
-        help="飞常准 API Key",
+        default=None,
+        help="飞常准 API Key (不指定则需配合 --auto-renew 自动获取)",
     )
     parser.add_argument(
         "--date", "-d",
@@ -2654,6 +2667,20 @@ def main():
     # Resend Key: CLI 参数 > 环境变量
     if not args.resend_key:
         args.resend_key = os.environ.get("RESEND_API_KEY")
+
+    # 未显式指定 Key 时先续杯拿一把可用的。提前拿好，避免后面每个
+    # API 实例各自撞一次「Key 不可用」再分别续杯，白白浪费时间。
+    if not args.key:
+        if not args.auto_renew:
+            print("[错误] 未指定 API Key，请用 --key 指定，"
+                  "或加 --auto-renew 自动获取", file=sys.stderr)
+            sys.exit(1)
+        print("  [续杯] 未指定 Key，自动获取...", file=sys.stderr)
+        try:
+            args.key = obtain_new_key(verbose=True)
+        except Exception as e:
+            print(f"[错误] 自动获取 Key 失败: {e}", file=sys.stderr)
+            sys.exit(1)
 
     SIGNIFICANT_DELAY_MINUTES = args.threshold
     MIN_BOOKING_WINDOW_MINUTES = args.booking_window
