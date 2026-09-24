@@ -19,10 +19,10 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    # 全量扫描推算：690 次请求 × 1.41 秒 = 16 分钟，
-    # 加 7 把 Key 的获取开销（1×112s + 6×90s）≈ 11 分钟，合计约 27 分钟。
+    # 全量扫描推算（南航系 + 国航系）：816 次请求 × 1.41 秒 ≈ 19 分钟，
+    # 加 8 把 Key 的获取开销（1×112s + 7×90s）≈ 12 分钟，合计约 31 分钟。
     # cron 已放宽到 2 小时一次，不再受 30 分钟间隔约束，故留足余量。
-    timeout-minutes: 36
+    timeout-minutes: 45
     env:
       NOTIFY_EMAIL: 'nicolasdeng1989@gmail.com'
 
@@ -69,7 +69,7 @@ jobs:
       # 步骤级超时 + continue-on-error 则只中断扫描本身，
       # 验证器和缓存保存照常执行。
       - name: Run detection
-        timeout-minutes: 32
+        timeout-minutes: 40
         continue-on-error: true
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
