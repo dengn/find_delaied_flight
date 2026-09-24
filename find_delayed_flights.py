@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-南航航变机会检测器
-检测「前序飞机铁定来不及、但航司尚未发布航变通知」的南航航班。
+航变机会检测器
+检测「前序飞机铁定来不及、但航司尚未发布航变通知」的航班。
+默认覆盖南航系与国航系（含深航/山航/昆航），可用 --airline 切换。
 
 核心逻辑：
   1. 扫描各枢纽的进港航班，找到前序飞机严重延误的情况
@@ -107,6 +108,24 @@ CZ_HUBS = {
     ],
     "TSN": [  # 天津 —— 非南航基地
         "CAN", "SZX", "PVG", "HGH", "CKG", "CSX", "KMG",
+    ],
+}
+
+# 国航系枢纽 —— 仅补充 CZ_HUBS 未覆盖的国航系基地。
+# 与 CZ_HUBS 重名的枢纽（如 SZX、TNA）无需在此重复：出港查询按航线返回
+# 全航司航班，国航系航班在原有扫描中即可被匹配到，不产生额外 API 开销。
+# 真正的缺口是 PEK —— 南航主运营在大兴 PKX，首都机场完全没被扫过，
+# 而它正是国航最大的基地。
+CA_HUBS = {
+    "PEK": [  # 北京首都 —— 国航最大枢纽
+        "CAN", "SZX", "PVG", "SHA", "CTU", "TFU", "CKG", "KMG",
+        "XIY", "WUH", "CSX", "HGH", "NKG", "XMN", "TAO", "DLC",
+        "SHE", "HRB", "URC", "HAK", "SYX", "FOC", "KWE", "CGO",
+    ],
+    "CTU": [  # 成都双流 —— 国航西南基地
+        "PEK", "CAN", "SZX", "PVG", "SHA", "HGH", "NKG", "XIY",
+        "KMG", "WUH", "CSX", "XMN", "TAO", "HAK", "SYX", "URC",
+        "LXA", "CGO",
     ],
 }
 
@@ -319,15 +338,73 @@ def build_weather_smart_hubs(api, base_hubs: dict, verbose: bool = True) -> tupl
     return smart_hubs, weather_report
 
 
-# 南航集团及生态航司 IATA 前缀
-# CZ=南航, XO=重庆航空(南航控股), TV=西藏航空(南航参股),
-# MF=厦门航空(南航控股), JD=首都航空(关联), GJ=长龙航空(关联)
-CZ_GROUP_PREFIXES = ("CZ", "XO", "MF")
+# ============================================================
+# 目标航司
+# ============================================================
+# prefixes       —— 出港"受害航班"的匹配前缀（决定检测哪些航班）
+# group_prefixes —— 集团/生态航司，仅用于进港延误飞机的展示过滤
+# mileage_url    —— 邮件里的里程票查询入口
+TARGET_AIRLINES = {
+    "CZ": {
+        "name": "南航",
+        # 保持原有行为：受害航班只认 CZ 本身
+        "prefixes": ("CZ",),
+        # XO=重庆航空(控股), MF=厦门航空(控股)
+        "group_prefixes": ("CZ", "XO", "MF"),
+        "mileage_url":
+            "https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html",
+    },
+    "CA": {
+        "name": "国航",
+        # CA=国航, ZH=深圳航空(控股), SC=山东航空(第一大股东),
+        # KY=昆明航空(深航子公司)
+        "prefixes": ("CA", "ZH", "SC", "KY"),
+        "group_prefixes": ("CA", "ZH", "SC", "KY"),
+        # 注：国航官网对非浏览器 UA 返回 418，此处只用可确认存在的主站入口
+        "mileage_url": "https://www.airchina.com.cn/",
+    },
+}
+
+# 本次运行实际扫描的航司，由 --airline 指定
+ACTIVE_AIRLINES = ["CZ", "CA"]
 
 
-def is_cz_group_flight(flight_no: str) -> bool:
-    """判断是否为南航集团/生态航班"""
-    return flight_no.startswith(CZ_GROUP_PREFIXES)
+def active_prefixes() -> tuple:
+    """当前启用航司的全部受害航班前缀"""
+    return tuple(p for code in ACTIVE_AIRLINES
+                 for p in TARGET_AIRLINES[code]["prefixes"])
+
+
+def active_group_prefixes() -> tuple:
+    """当前启用航司的全部集团/生态前缀"""
+    return tuple(p for code in ACTIVE_AIRLINES
+                 for p in TARGET_AIRLINES[code]["group_prefixes"])
+
+
+def active_airlines_label() -> str:
+    """用于日志与邮件标题，如「南航/国航」"""
+    return "/".join(TARGET_AIRLINES[c]["name"] for c in ACTIVE_AIRLINES)
+
+
+def airline_of(flight_no: str) -> str | None:
+    """按航班号前缀判断所属目标航司，返回 TARGET_AIRLINES 的键"""
+    for code, conf in TARGET_AIRLINES.items():
+        if flight_no.startswith(conf["prefixes"]):
+            return code
+    return None
+
+
+def mileage_url_for(flight_no: str) -> str:
+    """该航班所属航司的里程票查询入口"""
+    code = airline_of(flight_no)
+    if code:
+        return TARGET_AIRLINES[code]["mileage_url"]
+    return TARGET_AIRLINES["CZ"]["mileage_url"]
+
+
+def is_target_group_flight(flight_no: str) -> bool:
+    """判断是否为当前启用航司的集团/生态航班"""
+    return flight_no.startswith(active_group_prefixes())
 
 
 # 最小过站时间（分钟）
@@ -371,10 +448,10 @@ class VariFlightAPI:
         self._interval = interval
         self._auto_renew = auto_renew
         self._renew_count = 0
-        # 一把新 Key 的 5000 额度约够 110 次请求（~45 单位/次），
-        # 而全量 smart-scan 约需 690 次，即一轮要烧 7 把 Key。
-        # 上限设 8 留出余量；每次续杯约耗时 85 秒。
-        self._max_renew = 8
+        # 一把新 Key 的 5000 额度约够 110 次请求（~45 单位/次）。
+        # 全量 smart-scan 覆盖南航系 + 国航系后约需 816 次，即一轮
+        # 要烧约 8 把 Key。上限设 10 留出余量；每次续杯约耗时 85 秒。
+        self._max_renew = 10
         self._last_call = 0.0
         self.call_count = 0
         self.error_count = 0
@@ -952,7 +1029,7 @@ def run_detection(api_key: str, date: str, hubs: dict,
     tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     print(f"\n{'='*70}")
-    print(f"  南航航变机会检测器")
+    print(f"  {active_airlines_label()}航变机会检测器")
     print(f"  检测日期: {date}")
     print(f"  运行时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  买票窗口: 距起飞 >= {MIN_BOOKING_WINDOW_MINUTES} 分钟")
@@ -1048,7 +1125,7 @@ def run_detection(api_key: str, date: str, hubs: dict,
 
         # ---- Step 2: 收集出港CZ航班（找受害航班）----
         # 扫描今天 + 明天（跨天场景）
-        print(f"  [Step 2] 扫描出港南航航班（找受害航班）...")
+        print(f"  [Step 2] 扫描出港{active_airlines_label()}航班（找受害航班）...")
         departing_cz = []
         all_hub_departures = []
         dates_to_scan = [date]
@@ -1061,14 +1138,14 @@ def run_detection(api_key: str, date: str, hubs: dict,
                 all_hub_departures.extend(flights)
                 for fl in flights:
                     fno = fl.get("FlightNo", "")
-                    if fno.startswith("CZ"):
+                    if fno.startswith(active_prefixes()):
                         departing_cz.append(fl)
                 if (i + 1) % 10 == 0:
                     label = "今天" if scan_date == date else "明天"
                     print(f"    {label}出港扫描: {i+1}/{len(destinations)}  "
-                          f"(南航 {len(departing_cz)} 个)")
+                          f"({active_airlines_label()} {len(departing_cz)} 个)")
 
-        print(f"    南航出港航班共 {len(departing_cz)} 个"
+        print(f"    {active_airlines_label()}出港航班共 {len(departing_cz)} 个"
               f"（今天+明天）")
 
         if api.error_count > 0:
@@ -1133,12 +1210,12 @@ def run_detection(api_key: str, date: str, hubs: dict,
             "airport_situation": airport_sit,
             "hits_count": len(hub_hits),
         }
-        # 保存延误飞机详情（只保留南航集团航班）
+        # 保存延误飞机详情（只保留目标航司集团航班）
         for ac in delayed_aircraft:
             fl = max(aircraft_inbound[ac],
                      key=lambda f: get_best_arrival_time(f) or datetime.min)
             fno = fl.get("FlightNo", "")
-            if not is_cz_group_flight(fno):
+            if not is_target_group_flight(fno):
                 continue
             est_arr = get_best_arrival_time(fl)
             plan_arr = parse_time(fl.get("FlightArrtimePlanDate", ""))
@@ -1403,7 +1480,7 @@ def build_email_html(hits: list) -> str:
           {f" | 原因: {hit['inbound_delay_reason']}" if hit.get('inbound_delay_reason') else ""}
           &nbsp;|&nbsp; 过站需 {hit['min_turnaround_min']}分钟</td></tr>
         <tr><td colspan="2" style="padding:8px 12px;">
-          <a href="https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html"
+          <a href="{mileage_url_for(hit['flight'])}"
              target="_blank"
              style="display:inline-block; padding:8px 20px;
                     background:#1a73e8; color:white; font-size:14px;
@@ -1419,7 +1496,7 @@ def build_email_html(hits: list) -> str:
     <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;">
     <div style="max-width:700px; margin:0 auto;">
       <div style="background:#c0392b; color:white; padding:16px; text-align:center;">
-        <h2 style="margin:0;">南航航变机会提醒</h2>
+        <h2 style="margin:0;">{active_airlines_label()}航变机会提醒</h2>
         <p style="margin:4px 0 0; font-size:13px;">检测时间: {now_str}</p>
       </div>
       <div style="padding:12px; background:#fff3f3; text-align:center;">
@@ -1432,7 +1509,7 @@ def build_email_html(hits: list) -> str:
       </table>
       <div style="padding:12px; background:#f9f9f9; color:#999; font-size:12px;
                   text-align:center;">
-        南航航变机会检测器 — 持续监控中
+        {active_airlines_label()}航变机会检测器 — 持续监控中
       </div>
     </div>
     </body></html>
@@ -1547,7 +1624,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
             <div style="margin-bottom:4px;">
               <span style="color:#666;">进港航班:</span> {info.get('inbound_total', 0)} 个
               &nbsp;|&nbsp;
-              <span style="color:#666;">南航出港:</span> {info.get('cz_departing', 0)} 个
+              <span style="color:#666;">{active_airlines_label()}出港:</span> {info.get('cz_departing', 0)} 个
             </div>
             <div style="margin-bottom:4px;">
               <span style="color:#666;">机场态势:</span>
@@ -1556,7 +1633,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
               &nbsp; 平均延误 {sit.get('avg_delay_min', 0)} 分钟
             </div>
             <div style="margin-bottom:4px;">
-              <span style="color:#666;">南航集团严重延误进港:</span>
+              <span style="color:#666;">{active_airlines_label()}集团严重延误进港:</span>
             </div>
             <div>{delayed_list}</div>
           </td>
@@ -1573,7 +1650,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
             mins_remain = mins_left % 60
             is_priority = hit.get("is_priority", False)
             overdue_min = hit.get("inbound_overdue_min", 0)
-            mileage_url = "https://b2c.csair.com/B2CWeb/pub/page/mileage/search.html"
+            mileage_url = mileage_url_for(hit["flight"])
 
             # 重点关注标签
             priority_html = ""
@@ -1724,7 +1801,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                 box-shadow:0 2px 8px rgba(0,0,0,0.1);">
       <div style="background:{banner_bg}; color:white; padding:20px;
                   text-align:center;">
-        <h2 style="margin:0;">南航航变检测报告</h2>
+        <h2 style="margin:0;">{active_airlines_label()}航变检测报告</h2>
         <p style="margin:8px 0 0; font-size:14px; opacity:0.9;">
           {now_str} &nbsp; | &nbsp; 检测日期: {summary.get('date', 'N/A')}
         </p>
@@ -1756,7 +1833,7 @@ def build_summary_email_html(summary: dict, hits: list) -> str:
                   font-size:12px; text-align:center; border-top:1px solid #eee;">
         API 请求 {summary.get('api_calls', 0)} 次
         (失败 {summary.get('api_errors', 0)} 次)
-        &nbsp;|&nbsp; 南航航变机会检测器
+        &nbsp;|&nbsp; {active_airlines_label()}航变机会检测器
       </div>
     </div>
     </body></html>
@@ -1782,12 +1859,12 @@ def send_summary_email(to_addr: str, resend_key: str,
     html = build_summary_email_html(summary, hits)
 
     # 纯文本备用
-    text_lines = [f"南航航变检测报告 {run_time}", f"检测日期: {date}", ""]
+    text_lines = [f"{active_airlines_label()}航变检测报告 {run_time}", f"检测日期: {date}", ""]
     for hub, info in summary.get("hubs", {}).items():
         sit = info.get("airport_situation", {})
         text_lines.append(
             f"[{hub}] 进港{info.get('inbound_total',0)}班 "
-            f"南航出港{info.get('cz_departing',0)}班 "
+            f"{active_airlines_label()}出港{info.get('cz_departing',0)}班 "
             f"延误率{sit.get('delay_rate',0)*100:.0f}% "
             f"天气:{info.get('weather','N/A')}")
         for d in info.get("delayed_details", []):
@@ -2217,7 +2294,7 @@ def build_tracking_email_html(changes: list) -> str:
       </div>
       <div style="padding:10px 16px; background:#f9f9f9; color:#999;
                   font-size:12px; text-align:center;">
-        南航航变检测器 — 飞机调换跟踪
+        {active_airlines_label()}航变检测器 — 飞机调换跟踪
       </div>
     </div>
     </body></html>
@@ -2358,7 +2435,7 @@ def monitor_loop(args, hubs: dict):
     total_hits_found = 0
 
     print(f"\n{'='*70}")
-    print(f"  南航航变机会 — 持续监控模式")
+    print(f"  {active_airlines_label()}航变机会 — 持续监控模式")
     print(f"  监控周期: 每 {cycle_min} 分钟")
     print(f"  通知邮箱: {args.email}")
     print(f"  活跃时段: {args.active_start}:00 - {args.active_end}:00")
@@ -2515,10 +2592,11 @@ def monitor_loop(args, hubs: dict):
 def main():
     global SIGNIFICANT_DELAY_MINUTES, MIN_TURNAROUND_NARROW, \
         MIN_TURNAROUND_WIDE, MIN_BOOKING_WINDOW_MINUTES, \
-        MIN_ESTIMATED_DELAY_MINUTES, MAX_PLANNED_GAP_MINUTES
+        MIN_ESTIMATED_DELAY_MINUTES, MAX_PLANNED_GAP_MINUTES, \
+        ACTIVE_AIRLINES
 
     parser = argparse.ArgumentParser(
-        description="南航航变机会检测器 — 找到铁定延误但未通知的航班，提前购买里程票",
+        description="航变机会检测器 — 找到铁定延误但未通知的航班，提前购买里程票",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 原理:
@@ -2552,9 +2630,16 @@ def main():
         help="查询日期 YYYY-MM-DD (默认今天)",
     )
     parser.add_argument(
+        "--airline",
+        default="all",
+        choices=["cz", "ca", "all"],
+        help="扫描哪些航司: cz=南航系, ca=国航系(含深航/山航/昆航), "
+             "all=两者 (默认 all)",
+    )
+    parser.add_argument(
         "--hub",
         action="append",
-        help="枢纽机场代码，可多次使用 (默认: CAN, PKX, URC, SZX)",
+        help="枢纽机场代码，可多次使用 (默认: 按 --airline 自动选择)",
     )
     parser.add_argument(
         "--dest",
@@ -2691,17 +2776,32 @@ def main():
         MIN_TURNAROUND_NARROW = args.turnaround
         MIN_TURNAROUND_WIDE = args.turnaround
 
+    # 目标航司
+    ACTIVE_AIRLINES = {"cz": ["CZ"], "ca": ["CA"],
+                       "all": ["CZ", "CA"]}[args.airline]
+
+    # 默认枢纽表：按启用航司合并；同名枢纽合并目的地并去重保序
+    default_hubs = {}
+    if "CZ" in ACTIVE_AIRLINES:
+        default_hubs.update({h: list(d) for h, d in CZ_HUBS.items()})
+    if "CA" in ACTIVE_AIRLINES:
+        for h, dests in CA_HUBS.items():
+            default_hubs[h] = list(dict.fromkeys(
+                default_hubs.get(h, []) + list(dests)))
+
     if args.hub:
         if args.dest:
             destinations = [d.strip().upper() for d in args.dest.split(",")]
             hubs = {h.upper(): destinations for h in args.hub}
         else:
             hubs = {}
+            fallback = list(default_hubs.get("CAN")
+                            or next(iter(default_hubs.values()), []))
             for h in args.hub:
                 h = h.upper()
-                hubs[h] = CZ_HUBS.get(h, list(CZ_HUBS.get("CAN", [])))
+                hubs[h] = default_hubs.get(h, fallback)
     else:
-        hubs = CZ_HUBS
+        hubs = default_hubs
 
     # ---- 天气智能扫描：预判天气 → 动态扩展扫描范围 ----
     weather_report = {}
