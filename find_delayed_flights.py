@@ -371,7 +371,10 @@ class VariFlightAPI:
         self._interval = interval
         self._auto_renew = auto_renew
         self._renew_count = 0
-        self._max_renew = 3
+        # 一把新 Key 的 5000 额度约够 110 次请求（~45 单位/次），
+        # 而全量 smart-scan 约需 690 次，即一轮要烧 7 把 Key。
+        # 上限设 8 留出余量；每次续杯约耗时 85 秒。
+        self._max_renew = 8
         self._last_call = 0.0
         self.call_count = 0
         self.error_count = 0
